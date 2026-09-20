@@ -1805,11 +1805,48 @@ impl<'a> Emulator<'a> {
             }
             M::Incsspq | M::Incsspd => Step::Next(next),
 
-            // Boxed / unmodelled but semantically inert for our purposes.
-            M::Int3 => Step::Stopped(Stop::Unsupported {
-                site: ip,
-                text: "int3".into(),
-            }),
+            // TVM ends a guest-exit trampoline with a bare 0xCC:
+            //     push qword ptr [rax + 0x80]   ; guest FLAGS
+            //     popfq
+            //     push qword ptr [rax + 0x20]   ; guest RSP
+            //     mov  rax, qword ptr [rax]     ; rax = guest continuation address
+            //     mov  rsp, qword ptr [rsp]     ; stack pivot back to the guest
+            //     int3                          ; <-- control leaves through RAX
+            // The block genuinely ends there, so model it as the indirect jump it is by
+            // reusing the M::Ret primitive: Stop::Return{dest} becomes a TailCall when
+            // dest is a concrete code address, and a Return otherwise.
+            //
+            // Gate on the *shape*, not on the opcode alone. A bare 0xCC is otherwise
+            // just padding, or -- as observed in the wild -- the byte right after an
+            // indirect jmp that landed mid-instruction. Treating every 0xCC as a
+            // transfer fabricates jumps into trap/padding bytes (a real sample produced
+            // a tail call to the int3 byte itself), so require the stack pivot that only
+            // the exit trampoline has: the 4 bytes before the trap are mov rsp,[rsp].
+            M::Int3 => {
+                const EXIT_TRAMPOLINE_STACK_PIVOT: [u8; 4] = [0x48, 0x8B, 0x24, 0x24];
+                let in_exit_trampoline = self
+                    .pe
+                    .read_va(ip.wrapping_sub(4), 4)
+                    .is_some_and(|b| b == EXIT_TRAMPOLINE_STACK_PIVOT.as_slice());
+                if !in_exit_trampoline {
+                    return Step::Stopped(Stop::Unsupported {
+                        site: ip,
+                        text: "int3".into(),
+                    });
+                }
+                let dest = self.state.reg(Reg::Rax);
+                // Never fabricate a transfer into a trap byte: a concrete destination
+                // that lands on 0xCC is a bogus computed index, not a continuation.
+                if let Some(t) = self.arena.as_const(dest) {
+                    if self.pe.read_u8(t) == Some(0xCC) {
+                        return Step::Stopped(Stop::Unsupported {
+                            site: ip,
+                            text: "int3 into trap byte".into(),
+                        });
+                    }
+                }
+                Step::Stopped(Stop::Return { site: ip, dest })
+            }
 
             other => {
                 // SSE data movement, modelled rather than boxed.
