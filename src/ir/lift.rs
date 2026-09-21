@@ -902,6 +902,13 @@ impl<'a> Emulator<'a> {
             });
             return v;
         }
+        // The address is not concrete, but it may still take only two values: the
+        // VM reads its dispatch tables with `mov eax, [C + (cond << k)]`. Resolve
+        // that here rather than leaving an opaque read behind.
+        if let Some(v) = self.load_via_predicate_split(addr, width, site) {
+            return v;
+        }
+
         let v = self.arena.load(addr, width);
         self.symbolic_loads.push((site, width));
         // A symbolic address is only a guest access if it is rooted in guest state. A guest load computes its address from guest registers, so the expression reaches a parameter or an entry register.
@@ -914,6 +921,85 @@ impl<'a> Emulator<'a> {
             region,
         });
         v
+    }
+
+    /// Resolve a load whose address is not concrete but takes exactly two values,
+    /// by splitting on a 0/1 subexpression of it.
+    ///
+    /// The VM reads dispatch tables as `mov eax, [C + (cond << k)]`, where `cond`
+    /// is a guest predicate the evaluator cannot decide. Pinning it both ways makes
+    /// the address constant each way, and when both are readable image bytes the
+    /// read is `cond ? [C+k] : [C]` instead of opaque.
+    ///
+    /// The reason this is worth doing is not the value itself but what it unblocks:
+    /// the VM folds a condition to a constant with `load(A) - load(A)`. Those two
+    /// loads are separate nodes whenever a store landed between them, but once each
+    /// resolves to the same pair of constants they intern to one `select` node and
+    /// the subtraction collapses -- which is what lets the dispatch above it become
+    /// a two-way branch that recovery can split.
+    ///
+    /// Only a two-way split is attempted. An address with more freedom is left
+    /// symbolic: enumerating it needs a sound bound on the predicate, and recovery
+    /// already has `narrow_indices` for the cases where such a bound exists.
+    fn load_via_predicate_split(&mut self, addr: Ref, width: Width, site: u64) -> Option<Ref> {
+        let candidates = boolean_subexpressions(&mut self.arena, addr);
+        for cand in candidates {
+            if self.pins.iter().any(|(p, _)| *p == cand) {
+                continue;
+            }
+            let mut alts = [None, None];
+            for (i, value) in [0u64, 1u64].into_iter().enumerate() {
+                let saved_pins = self.pins.len();
+                let saved_watermark = self.memo_pin_count;
+                self.pins.push((cand, value));
+                self.subst_memo.clear();
+                self.pin_dep.clear();
+                self.memo_pin_count = self.pins.len();
+                let folded = self.substitute(addr);
+                alts[i] = self.arena.as_const(folded);
+                self.pins.truncate(saved_pins);
+                self.subst_memo.clear();
+                self.pin_dep.clear();
+                self.memo_pin_count = saved_watermark;
+            }
+            let (Some(a0), Some(a1)) = (alts[0], alts[1]) else {
+                continue;
+            };
+            if a0 == a1 {
+                // Not a discriminator for this address after all.
+                continue;
+            }
+            let (Some(v0), Some(v1)) = (self.image_load(a0, width), self.image_load(a1, width)) else {
+                continue;
+            };
+            let v = self.arena.select(cand, v1, v0);
+            let region = self.region_of_symbolic(addr);
+            self.events.push(Event::Load {
+                addr,
+                value: v,
+                width,
+                site,
+                region,
+            });
+            return Some(v);
+        }
+        None
+    }
+
+    /// Read `width` bytes at a concrete address from the abstract byte map or the
+    /// image, under the same rule the concrete load path applies: never fold a read
+    /// from a section the loader or the runtime may have rewritten.
+    fn image_load(&mut self, addr: u64, width: Width) -> Option<Ref> {
+        let is_bss = self.pe.is_bss(addr);
+        if self.pe.is_writable(addr) && !is_bss {
+            return None;
+        }
+        if self.pe.is_loader_bound(addr, width.bytes() as u64) {
+            return None;
+        }
+        let pe = self.pe;
+        let img = |x: u64| pe.image_u8(x);
+        self.state.load_concrete(&mut self.arena, addr, width, img)
     }
 
     /// Forget bytes at addr without recording a separate event.
@@ -2461,6 +2547,44 @@ impl<'a> Emulator<'a> {
 }
 
 /// Whether the instruction has an FS/GS-relative memory operand. Only these two matter.
+/// Subexpressions of `r` that provably hold only 0 or 1, deepest first.
+///
+/// The VM's table indices are built by `cond ? A : B` compiled into arithmetic, so
+/// the predicate shows up below a `trunc32`/`zext64`/`shl` chain rather than as a
+/// bare value. Deepest first tries the innermost predicate before the composites
+/// built on top of it, which is the one that actually discriminates the address.
+fn boolean_subexpressions(a: &mut Arena, r: Ref) -> Vec<Ref> {
+    let mut out: Vec<(u32, Ref)> = Vec::new();
+    let mut stack = vec![(r, 0u32)];
+    let mut seen = std::collections::HashSet::new();
+    while let Some((cur, d)) = stack.pop() {
+        if !seen.insert(cur) {
+            continue;
+        }
+        // Every bit except bit 0 is provably zero, so the value is 0 or 1.
+        if !a.is_const(cur) && a.known_zero(cur) | 1 == u64::MAX {
+            out.push((d, cur));
+        }
+        match *a.op(cur) {
+            Op::Bin(_, x, y) => {
+                stack.push((x, d + 1));
+                stack.push((y, d + 1));
+            }
+            Op::Un(_, x) | Op::Zext(x) | Op::Sext(x) | Op::Trunc(x) | Op::Load(x, _) => {
+                stack.push((x, d + 1))
+            }
+            Op::Select(c, x, y) => {
+                stack.push((c, d + 1));
+                stack.push((x, d + 1));
+                stack.push((y, d + 1));
+            }
+            _ => {}
+        }
+    }
+    out.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
+    out.into_iter().map(|(_, r)| r).collect()
+}
+
 fn seg_relative(inst: &Instruction) -> bool {
     matches!(inst.segment_prefix(), Register::FS | Register::GS)
         && (0..inst.op_count()).any(|i| inst.op_kind(i) == OpKind::Memory)
@@ -2796,6 +2920,87 @@ mod tail_call_tests {
         assert!(!is_iat_tail_call(0x14002a168, &HashSet::new()));
     }
 }
+
+#[cfg(test)]
+mod predicate_split_tests {
+    use super::*;
+    use crate::ir::expr::{Arena, BinOp, Width};
+
+    /// The VM's table index is `cond ? A : B` compiled into `C + (cond << k)`. The
+    /// split needs the predicate, so it has to be offered as a candidate, while the
+    /// shifted value and the constant base must not be.
+    #[test]
+    fn the_predicate_under_a_shift_is_a_candidate_and_the_shifted_value_is_not() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rdx);
+        let y = a.init_reg(Reg::R8);
+        let cond = a.bin(BinOp::Ult, x, y);
+        let wide = a.zext(cond, Width::W64);
+        let three = a.constant(3, Width::W64);
+        let shifted = a.bin(BinOp::Shl, wide, three);
+        let base = a.constant(0x1400_0a01_ca, Width::W64);
+        let addr = a.bin(BinOp::Add, base, shifted);
+
+        let candidates = boolean_subexpressions(&mut a, addr);
+        assert!(
+            candidates.contains(&cond),
+            "the predicate was not offered as a candidate"
+        );
+        assert!(
+            !candidates.contains(&shifted),
+            "the shifted value is not 0/1 and must not be a candidate"
+        );
+        assert!(
+            !candidates.contains(&base),
+            "a constant must not be a candidate"
+        );
+        // Deepest first, so the innermost predicate is tried before anything built
+        // on top of it.
+        assert_eq!(candidates[0], cond);
+    }
+
+    /// A plain non-boolean address offers nothing, so the split costs a walk and
+    /// nothing more.
+    #[test]
+    fn an_address_without_a_predicate_offers_no_candidate() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rdx);
+        let base = a.constant(0x1400_0a01_ca, Width::W64);
+        let wide = a.zext(x, Width::W64);
+        let addr = a.bin(BinOp::Add, base, wide);
+        assert!(boolean_subexpressions(&mut a, addr).is_empty());
+    }
+
+    /// Pinning a predicate has to fold the address to two different constants, or
+    /// there is nothing to split on. This is the property `load_via_predicate_split`
+    /// relies on, checked without an emulator.
+    #[test]
+    fn pinning_the_predicate_folds_the_address_both_ways() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rdx);
+        let y = a.init_reg(Reg::R8);
+        let cond = a.bin(BinOp::Ult, x, y);
+        let three = a.constant(3, Width::W64);
+        let wide = a.zext(cond, Width::W64);
+        let shifted = a.bin(BinOp::Shl, wide, three);
+        let base = a.constant(0x1400_0a01_ca, Width::W64);
+        let addr = a.bin(BinOp::Add, base, shifted);
+
+        let zero = a.constant(0, Width::W64);
+        let one = a.constant(1, Width::W64);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(cond, zero);
+        let folded = a.rewrite(addr, &map);
+        assert_eq!(a.as_const(folded), Some(0x1400_0a01_ca));
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(cond, one);
+        let folded = a.rewrite(addr, &map);
+        assert_eq!(a.as_const(folded), Some(0x1400_0a01_d2));
+    }
+}
+
 
 #[cfg(test)]
 mod segment_tests {
