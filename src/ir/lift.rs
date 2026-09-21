@@ -924,6 +924,7 @@ impl<'a> Emulator<'a> {
         if let Some(a) = self.arena.as_const(addr) {
             self.state.forget_concrete(a, bytes);
             self.arena.bump_mem_gen();
+            self.arena.note_concrete_store(a, bytes);
         } else {
             // A symbolic address cannot be resolved against the byte map, so the
             // pending symbolic store is what a later load consults. Push an opaque
@@ -933,6 +934,7 @@ impl<'a> Emulator<'a> {
             let v = self.arena.opaque("boxed_mem", w);
             self.state.sym_stores.push((addr, v, w));
             self.arena.bump_mem_gen();
+            self.arena.note_symbolic_store();
         }
     }
 
@@ -954,6 +956,7 @@ impl<'a> Emulator<'a> {
             // Memory changed, so a later load of this address must not intern to
             // one taken before now. See `Op::Load`.
             self.arena.bump_mem_gen();
+            self.arena.note_concrete_store(a, width.bytes());
 
             let region = self.region_of_addr(a);
             self.events.push(Event::Store {
@@ -967,6 +970,7 @@ impl<'a> Emulator<'a> {
         }
         self.state.sym_stores.push((addr, value, width));
         self.arena.bump_mem_gen();
+        self.arena.note_symbolic_store();
         let region = self.region_of_symbolic(addr);
         self.events.push(Event::Store {
             addr,

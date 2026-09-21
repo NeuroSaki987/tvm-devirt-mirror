@@ -262,6 +262,23 @@ pub struct Arena {
     /// changes, so that a load taken after a write cannot intern to one taken
     /// before it. See [`Op::Load`].
     mem_gen: u32,
+    /// Generation of the last store through a *symbolic* address.
+    ///
+    /// A symbolic address may alias anything, so such a store separates every
+    /// load taken after it from every load taken before it. Concrete stores are
+    /// accounted for per cell instead; see [`Arena::concrete_gen`].
+    sym_write_gen: u32,
+    /// Generation of the last concrete store covering each aligned 8-byte cell.
+    ///
+    /// Stamping every concrete store onto every load is what the global
+    /// generation did, and the VM rewrites its whole context window on every
+    /// guest transition. Two loads of the same module global therefore almost
+    /// never shared a generation, so predicates the VM assembles out of them --
+    /// `load(A) - load(A) == 0`, which is how it folds a condition to a
+    /// constant -- never folded, and the dead edge stayed in the graph. Keying
+    /// the generation by cell keeps those loads identical while still separating
+    /// any two loads a store could actually reach.
+    concrete_gen: HashMap<u64, u32>,
     /// Memoized known-zero bit masks. Sound to cache because nodes are
     /// immutable once interned.
     known_zero: HashMap<Ref, u64>,
@@ -282,6 +299,8 @@ impl Clone for Arena {
             intern: self.intern.clone(),
             opaque_counter: self.opaque_counter,
             mem_gen: self.mem_gen,
+            sym_write_gen: self.sym_write_gen,
+            concrete_gen: self.concrete_gen.clone(),
             // Derived caches: cheaper to recompute on demand than to carry.
             known_zero: HashMap::new(),
             known_one: HashMap::new(),
@@ -411,10 +430,31 @@ impl Arena {
     }
 
     pub fn load(&mut self, addr: Ref, width: Width) -> Ref {
+        let gen_at = self.load_gen(addr, width.bytes());
         self.intern(Node {
-            op: Op::Load(addr, self.mem_gen),
+            op: Op::Load(addr, gen_at),
             width,
         })
+    }
+
+    /// The generation a load of `addr` has to be stamped with: the newest store
+    /// that could have changed the bytes it reads.
+    ///
+    /// A concrete store only reaches the cells it covers, so a load of module
+    /// data keeps its identity across the VM's own context saves. A symbolic
+    /// store could reach anywhere, so it separates the load from every earlier
+    /// one, and so does an address the evaluator could not resolve at all.
+    fn load_gen(&self, addr: Ref, bytes: u32) -> u32 {
+        let Some(a) = self.as_const(addr) else {
+            return self.mem_gen;
+        };
+        let mut gen_at = self.sym_write_gen;
+        for cell in cells(a, bytes) {
+            if let Some(g) = self.concrete_gen.get(&cell) {
+                gen_at = gen_at.max(*g);
+            }
+        }
+        gen_at
     }
 
     /// A load carrying an explicit generation, for rebuilding one that already exists.
@@ -429,6 +469,23 @@ impl Arena {
     /// ones. See [`Op::Load`].
     pub fn bump_mem_gen(&mut self) {
         self.mem_gen = self.mem_gen.wrapping_add(1);
+    }
+
+    /// Note a concrete store of `bytes` bytes at `addr`, at the generation
+    /// [`Arena::bump_mem_gen`] has just produced. Subsequent loads that cover
+    /// any of the same cells will be stamped with it.
+    pub fn note_concrete_store(&mut self, addr: u64, bytes: u32) {
+        let gen_at = self.mem_gen;
+        for cell in cells(addr, bytes) {
+            self.concrete_gen.insert(cell, gen_at);
+        }
+    }
+
+    /// Note a store through an address the evaluator could not resolve against
+    /// the byte map. Such a store may alias anything, so it invalidates every
+    /// load rather than a cell.
+    pub fn note_symbolic_store(&mut self) {
+        self.sym_write_gen = self.mem_gen;
     }
 
     /// The generation later loads will be stamped with.
@@ -1793,6 +1850,18 @@ pub fn is_guest_rooted(a: &Arena, r: Ref) -> bool {
         .any(|l| matches!(a.op(*l), Op::Param(..) | Op::InitReg(_)))
 }
 
+/// The aligned 8-byte cells covering `[addr, addr + bytes)`.
+///
+/// Over-approximating the range is what keeps invalidation sound: a store that
+/// touches any part of a cell invalidates the whole cell, never less. Aligning
+/// also keeps the map small, since a scalar access is then one or two entries
+/// whatever the stride of the accesses around it.
+fn cells(addr: u64, bytes: u32) -> impl Iterator<Item = u64> {
+    let first = addr & !7;
+    let last = addr.saturating_add(u64::from(bytes).saturating_sub(1)) & !7;
+    (first..=last).step_by(8)
+}
+
 pub fn leaves(a: &Arena, r: Ref) -> Vec<Ref> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -2009,6 +2078,93 @@ mod tests {
             before, after,
             "a load after a write interned to one taken before it"
         );
+    }
+
+    /// A concrete store reaches only the cells it covers, so two loads of the
+    /// same global stay one node across the VM's own context writes. The VM
+    /// rewrites its context window on every guest transition, so a global
+    /// generation separated them and `load(A) - load(A) == 0` -- the idiom the VM
+    /// folds a condition with -- never simplified.
+    #[test]
+    fn a_concrete_store_elsewhere_does_not_separate_loads_of_a_global() {
+        let mut a = Arena::new();
+        let global = a.constant(0x1400_7f10_8, Width::W64);
+
+        let before = a.load(global, Width::W64);
+        a.bump_mem_gen();
+        a.note_concrete_store(0x7fff_0000, 8);
+        let after = a.load(global, Width::W64);
+
+        assert_eq!(
+            before, after,
+            "an unrelated concrete store separated two loads of the same global"
+        );
+        // Which is the whole point: the VM's constant-condition idiom folds.
+        assert_eq!(
+            a.bin(BinOp::Sub, before, after),
+            a.constant(0, Width::W64),
+            "load(A) - load(A) did not fold to zero"
+        );
+    }
+
+    /// A store to the same cell still separates them, or the rule above would
+    /// fold away a genuine reload.
+    #[test]
+    fn a_concrete_store_to_the_same_cell_separates_loads() {
+        let mut a = Arena::new();
+        let global = a.constant(0x1400_7f10_8, Width::W64);
+
+        let before = a.load(global, Width::W64);
+        a.bump_mem_gen();
+        a.note_concrete_store(0x1400_7f10_8, 8);
+        let after = a.load(global, Width::W64);
+
+        assert_ne!(before, after, "a store to the cell did not separate the loads");
+    }
+
+    /// ... including a store that only partly covers the cell, or a narrower
+    /// access whose cell the load shares.
+    #[test]
+    fn a_partial_concrete_store_separates_loads_of_the_same_cell() {
+        let mut a = Arena::new();
+        let global = a.constant(0x1400_7f10_8, Width::W64);
+
+        let before = a.load(global, Width::W64);
+        a.bump_mem_gen();
+        a.note_concrete_store(0x1400_7f10_c, 1);
+        let after = a.load(global, Width::W64);
+
+        assert_ne!(before, after, "a partial store did not separate the loads");
+    }
+
+    /// A store the evaluator could not resolve may alias anything, so it must
+    /// separate loads the cell map knows nothing about.
+    #[test]
+    fn a_symbolic_store_separates_loads_of_a_global() {
+        let mut a = Arena::new();
+        let global = a.constant(0x1400_7f10_8, Width::W64);
+
+        let before = a.load(global, Width::W64);
+        a.bump_mem_gen();
+        a.note_symbolic_store();
+        let after = a.load(global, Width::W64);
+
+        assert_ne!(before, after, "a symbolic store did not separate the loads");
+    }
+
+    /// A load through an address that is not a constant cannot be matched
+    /// against the cell map, so it keeps the global generation behaviour.
+    #[test]
+    fn a_symbolic_address_load_still_uses_the_global_generation() {
+        let mut a = Arena::new();
+        let addr = sym(&mut a, Reg::Rsp);
+
+        let before = a.load(addr, Width::W8);
+        a.bump_mem_gen();
+        a.note_concrete_store(0x1400_7f10_8, 8);
+        let after = a.load(addr, Width::W8);
+
+        assert_ne!(before, after, "a symbolic address load ignored the generation");
     }
 
     /// Rebuilding an existing load must keep its generation. `graft` and
