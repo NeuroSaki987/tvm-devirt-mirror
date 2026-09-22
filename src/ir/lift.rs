@@ -606,6 +606,14 @@ impl<'a> Emulator<'a> {
     }
 
     /// Overwrite the guest register image with fresh SSA parameters, returning the parameter for each register. This is what makes a recovered block's expressions independent of the path that reached it.
+    ///
+    /// The parameters are deliberately left *unpinned*, even when the slot they
+    /// replace already holds a concrete value. Recovery cuts parameters exactly at
+    /// join blocks -- the ones with more than one predecessor -- so a value read
+    /// here came from whichever single path arrived first, and pinning the
+    /// parameter to it re-binds the block to that path. The block's successors
+    /// then inherit the assertion and compute with it, which is how a fork ends up
+    /// dispatching to an address the VM never reaches.
     pub fn seed_guest_params(&mut self, block: crate::ir::expr::BlockRef) -> Vec<(Reg, Ref)> {
         let Some(base) = self.locate_guest_context() else {
             return Vec::new();
@@ -614,12 +622,8 @@ impl<'a> Emulator<'a> {
         let layout = self.guest_layout.unwrap_or(LAYOUTS[0]);
         for (i, reg) in layout.order.iter().enumerate() {
             let addr = base.wrapping_add(layout.first_reg + i as u64 * 8);
-            let old = self.read_slot(addr).and_then(|v| self.arena.as_const(v));
             let p = self.arena.param(block, *reg);
             self.state.store_concrete(&self.arena, addr, p, Width::W64);
-            if let Some(c) = old {
-                self.pins.push((p, c));
-            }
             out.push((*reg, p));
         }
         out
