@@ -38,6 +38,18 @@ tvm-devirt write-devirt input.exe output.exe
 
 Run `tvm-devirt --help` or `tvm-devirt <command> --help` for all options.
 
+## Maintained Mirror Diagnostics
+
+This repository tracks [`jz0/tvm-devirt`](https://github.com/jz0/tvm-devirt) and carries an opt-in diagnostic command for investigating recovery paths that do not close:
+
+```bash
+tvm-devirt unresolved input.exe 0x140001000
+tvm-devirt unresolved input.exe 0x140001000 --json unresolved.json
+tvm-devirt unresolved input.exe 0x140001000 --max-blocks 1024
+```
+
+The report attributes every unresolved final CFG block, records failed indirect-branch expressions and candidate arms, validates CFG invariants, and describes expression-DAG growth. Diagnostic-only work is excluded from the recovery timeout so running the report does not change the recovery budget. The command is intended for developing and validating recovery improvements; it does not force unsafe branches to close.
+
 ## TVM Overview
 
 TVM replaces a native function with a trampoline into a VM dispatcher. The dispatcher executes native x86 handlers, but the protected function's architectural state lives in the VM context.
