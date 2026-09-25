@@ -93,12 +93,14 @@ fn fmt_vas(vas: &[u64]) -> String {
 }
 
 /// Emit x86 machine code for one function and write it, or hex-dump to stdout.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_devirt(
     path: &std::path::Path,
     va: u64,
     output: Option<&std::path::Path>,
     stack_base: u64,
     steps: usize,
+    max_blocks: usize,
     timeout: u64,
     dis: bool,
 ) -> Result<()> {
@@ -106,6 +108,7 @@ pub fn cmd_devirt(
     let start = resolve_start(&pe, va);
     let mut ex = explore::Explorer::new(&pe, stack_base);
     ex.step_budget = steps;
+    ex.block_budget = max_blocks;
     ex.time_budget = std::time::Duration::from_secs(timeout);
     let cfg = ex.recover(start);
 

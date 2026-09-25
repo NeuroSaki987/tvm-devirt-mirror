@@ -44,6 +44,9 @@ pub fn describe_stop(emu: &lift::Emulator, stop: &lift::Stop) -> String {
             format!("folding diverged at {site:#x} ({nodes} DAG nodes)")
         }
         lift::Stop::OutOfImage { site } => format!("left the image at {site:#x}"),
+        lift::Stop::BadTarget { site, target, .. } => {
+            format!("computed jump to non-executable {target:#x} at {site:#x}")
+        }
         lift::Stop::NoReturn { site } => {
             format!("call to a noreturn import at {site:#x}")
         }

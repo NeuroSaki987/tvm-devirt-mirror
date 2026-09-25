@@ -229,6 +229,16 @@ pub enum Stop {
     Diverged { site: u64, nodes: usize },
     /// Reached an address outside the image.
     OutOfImage { site: u64 },
+    /// A computed jump that folded to a concrete address that is not executable
+    /// code.
+    ///
+    /// This is the same situation [`Stop::OutOfImage`] reports, except that it is
+    /// raised *at the jump* while the destination expression still exists.
+    /// `run` can only look at the next instruction pointer, and by then the
+    /// expression that produced it is gone, so diagnostics are left with a bare
+    /// number. Carrying the expression here preserves why the jump failed without
+    /// claiming that another forced pin makes the observed outcome unreachable.
+    BadTarget { site: u64, dest: Ref, target: u64 },
     /// A call to a routine that never returns. The block ends at the call.
     NoReturn { site: u64 },
 }
@@ -398,7 +408,55 @@ impl<'a> Emulator<'a> {
         if !matches!(self.arena.op(*expr), Op::Param(..)) {
             return None;
         }
-        self.pins.iter().find(|(r, _)| r == expr).map(|(_, c)| *c)
+        first_pin(&self.pins, *expr)
+    }
+
+    /// Fold `r` with `cand` forced to `value`, taking precedence over any pin the state
+    /// already carries for it.
+    ///
+    /// `pins` is a list searched front to back and substitution takes the first match, so
+    /// appending a second entry for a candidate that is already pinned leaves the older
+    /// value in force. Asking what a *different* value would produce therefore needs the
+    /// old entry removed, not merely shadowed by a later one. Everything derived that the
+    /// substitution touches is restored before returning, so this is a query and not a
+    /// state change.
+    ///
+    /// Returns the folded destination, and the block identity the state would resume at.
+    pub fn probe_pin(&mut self, cand: Ref, value: u64, r: Ref) -> (Option<u64>, Option<u64>) {
+        let saved_pins = self.pins.clone();
+        let saved_watermark = self.memo_pin_count;
+        self.pins.retain(|(p, _)| *p != cand);
+        self.pins.push((cand, value));
+        let target = self.fold_now(r);
+        let vip = self.current_vip();
+        self.pins = saved_pins;
+        self.subst_memo.clear();
+        self.pin_dep.clear();
+        self.memo_pin_count = saved_watermark;
+        (target, vip)
+    }
+
+    /// Fold `r` with `cand = value` appended to the pin list, which is what a split attempt
+    /// does. Kept beside [`Self::probe_pin`] so the two can be compared: when they disagree,
+    /// an older pin for the same candidate was silently the one in force.
+    pub fn probe_pin_appended(&mut self, cand: Ref, value: u64, r: Ref) -> Option<u64> {
+        let saved_watermark = self.memo_pin_count;
+        self.pins.push((cand, value));
+        let target = self.fold_now(r);
+        self.pins.pop();
+        self.subst_memo.clear();
+        self.pin_dep.clear();
+        self.memo_pin_count = saved_watermark;
+        target
+    }
+
+    /// Substitute `r` under the current pin set and return the constant it folded to.
+    fn fold_now(&mut self, r: Ref) -> Option<u64> {
+        self.subst_memo.clear();
+        self.pin_dep.clear();
+        self.memo_pin_count = self.pins.len();
+        let folded = self.substitute(r);
+        self.arena.as_const(folded)
     }
 
     pub fn current_vip(&self) -> Option<u64> {
@@ -973,7 +1031,8 @@ impl<'a> Emulator<'a> {
                 // Not a discriminator for this address after all.
                 continue;
             }
-            let (Some(v0), Some(v1)) = (self.image_load(a0, width), self.image_load(a1, width)) else {
+            let (Some(v0), Some(v1)) = (self.image_load(a0, width), self.image_load(a1, width))
+            else {
                 continue;
             };
             let v = self.arena.select(cand, v1, v0);
@@ -1757,11 +1816,26 @@ impl<'a> Emulator<'a> {
                         }
                     }
                 }
-                let dest = self.read_op(&inst, 0);
-                let dest = self.substitute(dest);
+                // Kept alongside the substituted form: `substitute` is what folds
+                // the dispatch address down, so if the fold lands somewhere that
+                // is not code, this is the only copy that still shows why.
+                let raw_dest = self.read_op(&inst, 0);
+                let dest = self.substitute(raw_dest);
                 match self.arena.as_const(dest) {
                     Some(t) => {
-                        // A resolved indirect jump is a VM handler transition.
+                        // A resolved indirect jump is a VM handler transition only
+                        // when it actually lands on code. A destination
+                        // that folds to something outside the image (the VM's own
+                        // image base is the value this usually produces) would end
+                        // the block one iteration later as `OutOfImage`, with no
+                        // expression left to split on.
+                        if !self.pe.is_executable(t) {
+                            return Step::Stopped(Stop::BadTarget {
+                                site: ip,
+                                dest: raw_dest,
+                                target: t,
+                            });
+                        }
                         self.dispatches.push((ip, t));
                         // Reaching the identity of an already-recovered block
                         // closes a loop. Stopping keeps cost linear in the
@@ -2040,7 +2114,7 @@ impl<'a> Emulator<'a> {
             memo.insert(r, r);
             return r;
         }
-        if let Some(&(_, v)) = self.pins.iter().find(|(p, _)| *p == r) {
+        if let Some(v) = first_pin(&self.pins, r) {
             let w = self.arena.width(r);
             let k = self.arena.constant(v, w);
             memo.insert(r, k);
@@ -2790,6 +2864,100 @@ fn pick_vip_slot(seen: &HashMap<u64, HashSet<u64>>) -> Option<u64> {
         .map(|(off, _)| *off)
 }
 
+/// The value a pin set gives a node, if any.
+///
+/// First match wins, which is what makes appending a second pin for a node a no-op: the
+/// older entry is still found first. A caller that means to *change* a pinned value has
+/// to remove the old entry, not push another one; `Emulator::probe_pin` does exactly
+/// that, and `probe_pin_appended` exists so the two behaviours can be compared.
+fn first_pin(pins: &[(Ref, u64)], r: Ref) -> Option<u64> {
+    pins.iter().find(|(p, _)| *p == r).map(|(_, v)| *v)
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use crate::ir::expr::{Arena, Width};
+
+    /// Appending a pin for an already-pinned node cannot override it, because the
+    /// lookup is first-match-wins.
+    #[test]
+    fn a_later_pin_does_not_override_an_earlier_one() {
+        let mut a = Arena::default();
+        let x = a.opaque("x", Width::W64);
+        let y = a.opaque("y", Width::W64);
+        let z = a.opaque("z", Width::W64);
+        let pins = vec![(x, 1u64), (y, 7u64), (x, 0u64)];
+        assert_eq!(first_pin(&pins, x), Some(1), "the older entry wins");
+        assert_eq!(first_pin(&pins, y), Some(7));
+        assert_eq!(first_pin(&pins, z), None);
+    }
+
+    /// Removing the old entry is what lets a new value take effect, which is why a probe
+    /// that only pushed would report the wrong destination for the value it tested.
+    #[test]
+    fn removing_the_old_entry_is_what_lets_a_new_value_take_effect() {
+        let mut a = Arena::default();
+        let x = a.opaque("x", Width::W64);
+        let mut pins = vec![(x, 0u64)];
+        pins.push((x, 1));
+        assert_eq!(first_pin(&pins, x), Some(0), "appending changed nothing");
+        pins.retain(|(p, _)| *p != x);
+        pins.push((x, 1));
+        assert_eq!(
+            first_pin(&pins, x),
+            Some(1),
+            "the new value is now in force"
+        );
+    }
+
+    /// Diagnostics keep their stamps and stop being collected once taken, so a caller
+    /// that drains the sink cannot leak records into the next function.
+    #[test]
+    fn diagnostics_are_stamped_and_cleared() {
+        // Collection must stay opt-in: ordinary `Explorer::recover` callers never call
+        // `begin`, and a previous diagnostic is always shut down by `take`.
+        let _ = crate::vm::diag::take();
+        assert!(!crate::vm::diag::is_on());
+        crate::vm::diag::record_stop(crate::vm::diag::StopDiag::default());
+        assert!(crate::vm::diag::take().stops.is_empty(), "off means off");
+        crate::vm::diag::begin(0x1234);
+        crate::vm::diag::set_pass(2);
+        crate::vm::diag::record_stop(crate::vm::diag::StopDiag {
+            stop: "Diverged".into(),
+            ..Default::default()
+        });
+        let sink = crate::vm::diag::take();
+        assert_eq!(sink.stops.len(), 1);
+        assert_eq!(sink.stops[0].entry, 0x1234);
+        assert_eq!(sink.stops[0].pass, 2);
+        assert_eq!(sink.stops[0].stop, "Diverged");
+        assert_eq!(sink.final_pass, 2);
+        assert!(!crate::vm::diag::is_on());
+        crate::vm::diag::record_stop(crate::vm::diag::StopDiag::default());
+        assert!(crate::vm::diag::take().stops.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_time_is_excluded_per_pass_only_while_collection_is_on() {
+        crate::vm::diag::begin(0x1234);
+        crate::vm::diag::set_pass(1);
+        crate::vm::diag::measure(|| {
+            let mut value = 0u64;
+            for i in 0..10_000 {
+                value = std::hint::black_box(value.wrapping_add(i));
+            }
+        });
+        assert!(crate::vm::diag::excluded_time() > std::time::Duration::ZERO);
+
+        crate::vm::diag::set_pass(2);
+        assert_eq!(crate::vm::diag::excluded_time(), std::time::Duration::ZERO);
+        let _ = crate::vm::diag::take();
+        crate::vm::diag::measure(|| {});
+        assert_eq!(crate::vm::diag::excluded_time(), std::time::Duration::ZERO);
+    }
+}
+
 #[cfg(test)]
 mod vip_slot_tests {
     use super::*;
@@ -3004,7 +3172,6 @@ mod predicate_split_tests {
         assert_eq!(a.as_const(folded), Some(0x1400_0a01_d2));
     }
 }
-
 
 #[cfg(test)]
 mod segment_tests {

@@ -22,6 +22,30 @@ struct Task<'a> {
     ancestors: Vec<BlockId>,
 }
 
+#[cfg(test)]
+mod divergence_root_tests {
+    use super::*;
+    use crate::ir::expr::{Arena, Reg, Width};
+    use crate::vm::state::State;
+    use std::collections::HashSet;
+
+    #[test]
+    fn divergence_roots_include_state_and_active_pins() {
+        let mut arena = Arena::new();
+        let mut state = State::new(&mut arena, 0x7fff_ffff_0000);
+        let reg = arena.opaque("live-reg", Width::W64);
+        let pin = arena.opaque("live-pin", Width::W8);
+        state.regs.clear();
+        state.regs.insert(Reg::Rax, reg);
+
+        let roots: HashSet<_> = divergence_roots(&state, &[(pin, 1)], &[])
+            .into_iter()
+            .collect();
+        assert!(roots.contains(&reg));
+        assert!(roots.contains(&pin));
+    }
+}
+
 pub struct Explorer<'a> {
     pe: &'a PeFile,
     stack_base: u64,
@@ -104,6 +128,10 @@ impl<'a> Explorer<'a> {
         known: Option<&Cfg>,
         vip_slot: Option<u64>,
     ) -> Cfg {
+        // Pass 2 re-runs recovery with the joins cut and the concrete pass as a guide;
+        // the graph it returns is the one callers see, so a failure has to be
+        // attributable to the pass that produced it.
+        crate::vm::diag::set_pass(if known.is_some() { 2 } else { 1 });
         let entry_id = BlockId {
             handler: start,
             vip: None,
@@ -133,14 +161,17 @@ impl<'a> Explorer<'a> {
             ancestors: Vec::new(),
         }];
 
-        let deadline = std::time::Instant::now() + self.time_budget;
+        let pass_started = std::time::Instant::now();
 
         while let Some(mut task) = queue.pop() {
             // The work budget is the deterministic limit and should be the one that
             // fires. If the timer wins the race the result depends on machine load,
             // so say so rather than silently emitting different code than last run.
             let out_of_work = total_steps >= self.work_budget;
-            let out_of_time = std::time::Instant::now() >= deadline;
+            let recovery_elapsed = pass_started
+                .elapsed()
+                .saturating_sub(crate::vm::diag::excluded_time());
+            let out_of_time = recovery_elapsed >= self.time_budget;
             if out_of_time && !out_of_work {
                 timed_out = true;
             }
@@ -221,6 +252,17 @@ impl<'a> Explorer<'a> {
             // Locate the guest register image *before* the terminator is built.
             task.emu.locate_guest_context();
 
+            // Diagnostics: which stop kind ended this block, and where. Gated so it
+            // costs nothing in a normal run. The unresolved diagnostic needs the same
+            // two facts, so one computation serves both consumers.
+            let debug_stops = std::env::var_os("TVM_DEBUG_STOPS").is_some();
+            let diag_on = crate::vm::diag::is_on();
+            let stop_tag = if debug_stops || diag_on {
+                Some(stop_kind(&stop))
+            } else {
+                None
+            };
+            let stop_site = stop_site(&stop);
             let terminator = match stop {
                 Stop::Return { dest, .. } => match task.emu.arena.as_const(dest) {
                     // The VM leaves a function by jumping to the concrete
@@ -308,6 +350,35 @@ impl<'a> Explorer<'a> {
                 Stop::OutOfImage { site } => Terminator::Unresolved {
                     reason: format!("left image at {site:#x}"),
                 },
+                // Preserve the expression for diagnostics, but do not replace the
+                // observed non-executable outcome with forced executable arms. Doing
+                // so would silently discard a path already proved reachable by this
+                // task. Closing it safely needs an IR shape that retains that unresolved
+                // outcome alongside any executable alternatives.
+                Stop::BadTarget { site, dest, target } => {
+                    if diag_on {
+                        crate::vm::diag::measure(|| {
+                            let candidates = flag_candidates(&mut task.emu.arena, dest);
+                            let leaves = expr::leaves(&task.emu.arena, dest);
+                            let arg_dependent = leaves
+                                .iter()
+                                .any(|leaf| matches!(task.emu.arena.op(*leaf), Op::InitReg(_)));
+                            let enumerated = narrow_indices(&mut task.emu.arena, dest);
+                            self.record_split_diag(
+                                &mut task,
+                                site,
+                                dest,
+                                &candidates,
+                                &leaves,
+                                arg_dependent,
+                                &enumerated,
+                            );
+                        });
+                    }
+                    Terminator::Unresolved {
+                        reason: format!("left image at {site:#x} (folded to {target:#x})"),
+                    }
+                }
                 // The call is already recorded as an event; the block simply has
                 // no successor. Modelled as a return with no exit values, which is
                 // what the emitted code does: make the call, then nothing.
@@ -318,13 +389,58 @@ impl<'a> Explorer<'a> {
                     let d = task.emu.arena.opaque("noreturn", Width::W64);
                     Terminator::Return { dest: d }
                 }
-                Stop::Diverged { site, nodes } => Terminator::Unresolved {
-                    reason: format!("folding diverged at {site:#x} ({nodes} DAG nodes)"),
-                },
+                Stop::Diverged { site, nodes } => {
+                    // The fork's arena dies with this block, so the composition has to
+                    // be taken here or not at all. Gated: it walks the whole DAG.
+                    if diag_on {
+                        // The live roots: what the machine still holds, plus this block's
+                        // guest-visible effects. A node unreachable from these cannot
+                        // influence any later result, so the gap between this count and the
+                        // arena size is the mass a trimming rule would be discarding -- or
+                        // reclaiming, if it is provably dead.
+                        crate::vm::diag::measure(|| {
+                            let roots = divergence_roots(&task.emu.state, &task.emu.pins, &events);
+                            let live = task.emu.arena.reachable_from(&roots);
+                            let c = task.emu.arena.composition();
+                            crate::vm::diag::record_diverged(crate::vm::diag::DivergedDiag {
+                                entry: 0,
+                                pass: 0,
+                                handler: task.id.handler,
+                                vip: task.id.vip,
+                                site,
+                                nodes,
+                                dag_total: c.total,
+                                by_kind: c.by_kind,
+                                by_width: c.by_width,
+                                edges: c.edges,
+                                shared: c.shared,
+                                max_indegree: c.max_indegree,
+                                top_shared: c.top_shared,
+                                live_dag: live,
+                            });
+                        });
+                    }
+                    Terminator::Unresolved {
+                        reason: format!("folding diverged at {site:#x} ({nodes} DAG nodes)"),
+                    }
+                }
             };
 
-            if matches!(terminator, Terminator::Unresolved { .. }) {
+            if let Terminator::Unresolved { reason } = &terminator {
                 unresolved += 1;
+                if debug_stops && let Some(tag) = stop_tag {
+                    eprintln!("  [unresolved] stop={tag} :: {reason}");
+                }
+                if diag_on {
+                    crate::vm::diag::record_stop(crate::vm::diag::StopDiag {
+                        entry: 0,
+                        pass: 0,
+                        handler: task.id.handler,
+                        vip: task.id.vip,
+                        stop: stop_tag.unwrap_or("no-stop").to_string(),
+                        site: stop_site,
+                    });
+                }
             }
             if self.verbose {
                 eprintln!(
@@ -549,11 +665,21 @@ impl<'a> Explorer<'a> {
         dest: Ref,
         queue: &mut Vec<Task<'a>>,
     ) -> Terminator {
-        let candidates = flag_candidates(&task.emu.arena, dest);
+        let candidates = flag_candidates(&mut task.emu.arena, dest);
         if let Some(t) = self.split_two_way(task, site, dest, &candidates, queue) {
             return t;
         }
-        if let Some(t) = self.split_multiway(task, site, dest, queue) {
+        // The diagnostic needs the same index enumeration the multi-way split just
+        // built. Recomputing it would clone the whole arena a second time, and for a
+        // function with a million DAG nodes that clone dominates the run.
+        let mut enumerated: Vec<(Ref, u64)> = Vec::new();
+        if let Some(t) = self.split_multiway(
+            task,
+            site,
+            dest,
+            queue,
+            crate::vm::diag::is_on().then_some(&mut enumerated),
+        ) {
             return t;
         }
 
@@ -562,6 +688,22 @@ impl<'a> Explorer<'a> {
         let arg_dependent = leaves
             .iter()
             .any(|l| matches!(task.emu.arena.op(*l), Op::InitReg(_)));
+        // The reason string below is all that survives into the graph, so anything the
+        // caller may want to aggregate has to be captured here, while the expression,
+        // the state and the candidates all still exist.
+        if crate::vm::diag::is_on() {
+            crate::vm::diag::measure(|| {
+                self.record_split_diag(
+                    task,
+                    site,
+                    dest,
+                    &candidates,
+                    &leaves,
+                    arg_dependent,
+                    &enumerated,
+                );
+            });
+        }
         let detail = leaves
             .iter()
             .take(4)
@@ -608,6 +750,19 @@ impl<'a> Explorer<'a> {
                 }
             }
 
+            // Deliberately NOT accepting a single executable side here.
+            //
+            // It is tempting: if one pinning lands on code and the other does not,
+            // the surviving side looks like an unconditional jump. But a side that
+            // fails to fold is not thereby *proved* unreachable -- it may simply not
+            // be a constant under the pins in force. Turning that into a Jump
+            // replaces "unresolved" with a silently wrong single edge, and a wrong
+            // edge is worse than a missing one: it recovers fewer blocks while
+            // reporting fewer failures, which is exactly how such a change looks
+            // like an improvement. Measured on ACE-DFS64, enabling it changed five
+            // of 157 functions and removed blocks from two of them.
+            //
+            // Both sides, or neither.
             let (Some((f0, t0)), Some((f1, t1))) = (forks[0].take(), forks[1].take()) else {
                 continue;
             };
@@ -667,8 +822,12 @@ impl<'a> Explorer<'a> {
         site: u64,
         dest: Ref,
         queue: &mut Vec<Task<'a>>,
+        mut enumerated: Option<&mut Vec<(Ref, u64)>>,
     ) -> Option<Terminator> {
-        for (idx, span) in narrow_indices(&task.emu.arena, dest) {
+        for (idx, span) in narrow_indices(&mut task.emu.arena, dest) {
+            if let Some(out) = enumerated.as_deref_mut() {
+                out.push((idx, span));
+            }
             let mut arms: Vec<(Emulator<'a>, u64)> = Vec::new();
             let mut all_folded = true;
             for value in 0..=span {
@@ -724,6 +883,210 @@ impl<'a> Explorer<'a> {
             });
         }
         None
+    }
+
+    /// Everything still known about a branch that no split could resolve.
+    ///
+    /// Called only when collection is on, and only from the failure path, so it costs one
+    /// probe per failing block rather than one per candidate per block.
+    #[allow(clippy::too_many_arguments)]
+    fn record_split_diag(
+        &self,
+        task: &mut Task<'a>,
+        site: u64,
+        dest: Ref,
+        candidates: &[Ref],
+        leaves: &[Ref],
+        arg_dependent: bool,
+        enumerated: &[(Ref, u64)],
+    ) {
+        let record = self.collect_split_diag(
+            task,
+            site,
+            dest,
+            candidates,
+            leaves,
+            arg_dependent,
+            enumerated,
+        );
+        crate::vm::diag::record_split(record);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_split_diag(
+        &self,
+        task: &mut Task<'a>,
+        site: u64,
+        dest: Ref,
+        candidates: &[Ref],
+        leaves: &[Ref],
+        arg_dependent: bool,
+        enumerated: &[(Ref, u64)],
+    ) -> crate::vm::diag::SplitDiag {
+        // Bounded: a block with hundreds of candidates would otherwise cost more to
+        // describe than it did to fail.
+        const MAX_CANDIDATES: usize = 24;
+        const MAX_LEAVES: usize = 12;
+        const MAX_INDICES: usize = 8;
+
+        let (vm_lo, vm_hi) = self.vm_range();
+        let in_vm = |t: u64| vm_lo != 0 && t >= vm_lo && t < vm_hi;
+
+        let mut flag_candidates = Vec::new();
+        for cand in candidates.iter().take(MAX_CANDIDATES) {
+            let prior_pin = task
+                .emu
+                .pins
+                .iter()
+                .find(|(p, _)| p == cand)
+                .map(|(_, v)| *v);
+            let mut arms = Vec::new();
+            for value in [0u64, 1u64] {
+                let (target, vip) = task.emu.probe_pin(*cand, value, dest);
+                // With no older pin for this candidate, appending and forcing are the
+                // same operation, so the comparison cannot say anything and one of the
+                // two folds is skipped. A fold is not cheap: it invalidates the
+                // substitution caches and re-walks the dependency cone.
+                let naive = match prior_pin {
+                    Some(_) => task.emu.probe_pin_appended(*cand, value, dest),
+                    None => target,
+                };
+                arms.push(crate::vm::diag::PinArm {
+                    value,
+                    executable: target.is_some_and(|t| self.pe.is_executable(t)),
+                    in_vm_section: target.is_some_and(&in_vm),
+                    target,
+                    vip,
+                    naive_target: if naive == target { None } else { naive },
+                });
+            }
+            flag_candidates.push(crate::vm::diag::FlagProbe {
+                expr: render(&task.emu.arena, *cand, 6),
+                prior_pin,
+                arms,
+            });
+        }
+
+        let mut index_probes = Vec::new();
+        for (idx, span) in enumerated.iter().copied().take(MAX_INDICES) {
+            let mut arms = Vec::new();
+            let mut unfolded = false;
+            let mut non_executable_arms = 0usize;
+            for value in 0..=span {
+                let (target, vip) = task.emu.probe_pin(idx, value, dest);
+                let executable = target.is_some_and(|t| self.pe.is_executable(t));
+                if target.is_some() && !executable {
+                    non_executable_arms += 1;
+                }
+                if target.is_none() {
+                    unfolded = true;
+                }
+                arms.push(crate::vm::diag::SwitchArm {
+                    value,
+                    target,
+                    executable,
+                    in_vm_section: target.is_some_and(&in_vm),
+                    vip,
+                });
+            }
+            index_probes.push(crate::vm::diag::SwitchProbe {
+                expr: render(&task.emu.arena, idx, 6),
+                span,
+                arms,
+                unfolded,
+                non_executable_arms,
+            });
+        }
+
+        crate::vm::diag::SplitDiag {
+            entry: 0,
+            pass: 0,
+            handler: task.id.handler,
+            vip: task.id.vip,
+            site,
+            // Bounded depth: the reason string keeps only three levels, and a full DAG
+            // render of a large expression is neither readable nor cheap.
+            dest_expr: render(&task.emu.arena, dest, 12),
+            dest_width: format!("{:?}", task.emu.arena.width(dest)),
+            arg_dependent,
+            leaves: leaves
+                .iter()
+                .take(MAX_LEAVES)
+                .map(|l| render(&task.emu.arena, *l, 10))
+                .collect(),
+            leaf_total: leaves.len(),
+            flag_candidates,
+            narrow_indices: index_probes,
+        }
+    }
+}
+
+/// Expression roots retained outside the arena when a path stops diverging.
+/// Any future arena compaction must preserve and remap this complete set.
+fn divergence_roots(
+    state: &crate::vm::state::State,
+    pins: &[(Ref, u64)],
+    events: &[Event],
+) -> Vec<Ref> {
+    let mut roots = state.symbolic_roots();
+    roots.extend(pins.iter().map(|(expr, _)| *expr));
+    for event in events {
+        match event {
+            Event::Store { addr, value, .. } | Event::Load { addr, value, .. } => {
+                roots.push(*addr);
+                roots.push(*value);
+            }
+            Event::Boxed {
+                mem, defs, uses, ..
+            } => {
+                if let Some(mem) = mem {
+                    roots.push(mem.addr);
+                }
+                roots.extend(defs.iter().chain(uses.iter()).map(|(_, expr)| *expr));
+            }
+            Event::Call {
+                target, ret, args, ..
+            } => {
+                roots.extend(target.iter().copied());
+                roots.extend(ret.iter().copied());
+                roots.extend(args.iter().map(|(_, expr)| *expr));
+            }
+        }
+    }
+    roots
+}
+
+/// Name of a stop variant, for diagnostics.
+fn stop_kind(stop: &Stop) -> &'static str {
+    match stop {
+        Stop::SymbolicBranch { .. } => "SymbolicBranch",
+        Stop::NativeBranch { .. } => "NativeBranch",
+        Stop::Return { .. } => "Return",
+        Stop::Unsupported { .. } => "Unsupported",
+        Stop::Unreadable { .. } => "Unreadable",
+        Stop::Backedge { .. } => "Backedge",
+        Stop::Budget { .. } => "Budget",
+        Stop::Diverged { .. } => "Diverged",
+        Stop::OutOfImage { .. } => "OutOfImage",
+        Stop::BadTarget { .. } => "BadTarget",
+        Stop::NoReturn { .. } => "NoReturn",
+    }
+}
+
+/// Address a stop was raised at.
+fn stop_site(stop: &Stop) -> u64 {
+    match stop {
+        Stop::SymbolicBranch { site, .. }
+        | Stop::NativeBranch { site, .. }
+        | Stop::Return { site, .. }
+        | Stop::Unsupported { site, .. }
+        | Stop::Unreadable { site }
+        | Stop::Backedge { site, .. }
+        | Stop::Budget { site }
+        | Stop::Diverged { site, .. }
+        | Stop::OutOfImage { site }
+        | Stop::BadTarget { site, .. }
+        | Stop::NoReturn { site } => *site,
     }
 }
 
@@ -846,8 +1209,7 @@ fn graft_terminator(
 const MAX_SWITCH_ARMS: u64 = 63;
 
 /// Subexpressions of `dest` whose provable value range is narrow enough to enumerate, paired with the largest value each can take. The range is derived from known-zero bits, which makes enumeration sound: a value outside it is unreachable.
-fn narrow_indices(a: &Arena, dest: Ref) -> Vec<(Ref, u64)> {
-    let mut probe = a.clone();
+fn narrow_indices(a: &mut Arena, dest: Ref) -> Vec<(Ref, u64)> {
     let mut out: Vec<(Ref, u64)> = Vec::new();
     let mut seen = HashSet::new();
     let mut stack = vec![dest];
@@ -858,7 +1220,8 @@ fn narrow_indices(a: &Arena, dest: Ref) -> Vec<(Ref, u64)> {
         }
         if !a.is_const(cur) {
             // Bits that may be set, within the node's own width.
-            let live = !probe.known_zero(cur) & a.width(cur).mask();
+            let known_zero = a.known_zero(cur);
+            let live = !known_zero & a.width(cur).mask();
             // Only contiguous low-bit ranges are enumerated directly.
             if live != 0 && live.count_ones() == live.trailing_ones() && live <= MAX_SWITCH_ARMS {
                 out.push((cur, live));
@@ -892,7 +1255,7 @@ fn narrow_indices(a: &Arena, dest: Ref) -> Vec<(Ref, u64)> {
 /// Ordered so the most likely candidates come first, because each one costs two
 /// state forks to test: entry flags (opaque single-bit values), then any 8-bit
 /// boolean-producing node, innermost first.
-fn flag_candidates(a: &Arena, dest: Ref) -> Vec<Ref> {
+fn flag_candidates(a: &mut Arena, dest: Ref) -> Vec<Ref> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
@@ -908,12 +1271,11 @@ fn flag_candidates(a: &Arena, dest: Ref) -> Vec<Ref> {
     let mut ranked: Vec<(u32, Ref)> = Vec::new();
     let mut stack = vec![(dest, 0u32)];
     let mut walked = HashSet::new();
-    let mut probe = a.clone();
     while let Some((cur, d)) = stack.pop() {
         if !walked.insert(cur) {
             continue;
         }
-        if !a.is_const(cur) && probe.known_zero(cur) | 1 == u64::MAX {
+        if !a.is_const(cur) && a.known_zero(cur) | 1 == u64::MAX {
             // Every bit except bit 0 is provably zero: this is a 0/1 value.
             ranked.push((d, cur));
         }
@@ -1572,7 +1934,7 @@ mod candidate_tests {
         let addr = a.bin(BinOp::Add, idx, base);
         let dest = a.load(addr, Width::W32);
 
-        let cands = flag_candidates(&a, dest);
+        let cands = flag_candidates(&mut a, dest);
         assert!(
             !cands.is_empty(),
             "no candidates found for the VJCC index shape"

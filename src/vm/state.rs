@@ -140,6 +140,30 @@ impl State {
         self.flags.insert(f, v);
     }
 
+    /// Every expression reference retained by the architectural machine state.
+    /// Diagnostics and arena compaction must treat all of these as live roots.
+    pub fn symbolic_roots(&self) -> Vec<Ref> {
+        let mut roots = Vec::with_capacity(
+            self.regs.len()
+                + self.flags.len()
+                + self.mem.len()
+                + self.sym_stores.len() * 2
+                + self.xmm.len(),
+        );
+        roots.extend(self.regs.values().copied());
+        roots.extend(self.flags.values().copied());
+        roots.extend(self.mem.values().filter_map(|byte| match byte {
+            Byte::Sym { expr, .. } => Some(*expr),
+            Byte::Const(_) => None,
+        }));
+        for (addr, value, _) in &self.sym_stores {
+            roots.push(*addr);
+            roots.push(*value);
+        }
+        roots.extend(self.xmm.values().copied());
+        roots
+    }
+
     /// Concrete RSP, when it is one. VM exits are detected off this.
     pub fn concrete_rsp(&self, arena: &Arena) -> Option<u64> {
         arena.as_const(self.reg(Reg::Rsp))
@@ -307,5 +331,46 @@ impl State {
             Some(a) => a,
             None => arena.constant(0, width),
         })
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn symbolic_roots_include_every_ref_held_by_machine_state() {
+        let mut arena = Arena::new();
+        let mut state = State::new(&mut arena, 0x7fff_ffff_0000);
+        let reg = arena.opaque("reg-root", Width::W64);
+        let flag = arena.opaque("flag-root", Width::W8);
+        let mem = arena.opaque("mem-root", Width::W64);
+        let store_addr = arena.opaque("store-addr-root", Width::W64);
+        let store_value = arena.opaque("store-value-root", Width::W32);
+        let xmm = arena.opaque("xmm-root", Width::W64);
+
+        state.regs.clear();
+        state.flags.clear();
+        state.mem.clear();
+        state.sym_stores.clear();
+        state.xmm.clear();
+        state.regs.insert(Reg::Rax, reg);
+        state.flags.insert(Flag::Zf, flag);
+        state.mem.insert(
+            0x1000,
+            Byte::Sym {
+                expr: mem,
+                index: 0,
+            },
+        );
+        state.sym_stores.push((store_addr, store_value, Width::W32));
+        state.xmm.insert((0, XmmHalf::Low), xmm);
+
+        let roots: HashSet<_> = state.symbolic_roots().into_iter().collect();
+        assert_eq!(
+            roots,
+            HashSet::from([reg, flag, mem, store_addr, store_value, xmm])
+        );
     }
 }
