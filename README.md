@@ -1,46 +1,10 @@
-# tvm-devirt
+# tvm-devirt-mirror
 
-A static devirtualizer targeting Tencent VM (TVM). Recovers virtualized control flow & attempts to lower guest behavior back to native x86.
+这是 [`jz0/tvm-devirt`](https://github.com/jz0/tvm-devirt) 的持续维护镜像，主要保留和发展上游尚未包含的恢复诊断能力。
 
-Devirtualized DriverEntry of ACE-GAME.sys.
+反虚拟化、CFG 恢复、IR 和代码生成等基础功能来自原项目。这个仓库当前重点维护新增的 `unresolved` 命令，用来分析函数为什么没有完整恢复，并为后续恢复算法优化提供可复现数据。
 
-![Claude, write me a devirtualizer](img/devirt_entry.png)
-
-## Build
-
-```bash
-cargo build --release
-cargo test
-```
-
-## Usage
-
-List virtualized entry points:
-
-```bash
-tvm-devirt entries input.exe --all
-```
-
-Inspect one function:
-
-```bash
-tvm-devirt cfg input.exe 0x140001000
-tvm-devirt ssa input.exe 0x140001000
-tvm-devirt lower input.exe 0x140001000
-tvm-devirt devirt input.exe 0x140001000 --output function.bin
-```
-
-Devirtualize all recoverable functions, devirtualized code is appended at the end of .tvm0 section:
-
-```bash
-tvm-devirt write-devirt input.exe output.exe
-```
-
-Run `tvm-devirt --help` or `tvm-devirt <command> --help` for all options.
-
-## Maintained Mirror Diagnostics
-
-This repository tracks [`jz0/tvm-devirt`](https://github.com/jz0/tvm-devirt) and carries an opt-in diagnostic command for investigating recovery paths that do not close:
+## 相比原项目增加了什么
 
 ```bash
 tvm-devirt unresolved input.exe 0x140001000
@@ -48,65 +12,64 @@ tvm-devirt unresolved input.exe 0x140001000 --json unresolved.json
 tvm-devirt unresolved input.exe 0x140001000 --max-blocks 1024
 ```
 
-The report attributes every unresolved final CFG block, records failed indirect-branch expressions and candidate arms, validates CFG invariants, and describes expression-DAG growth. Diagnostic-only work is excluded from the recovery timeout so running the report does not change the recovery budget. The command is intended for developing and validating recovery improvements; it does not force unsafe branches to close.
+`unresolved` 会重新恢复指定函数，并额外输出：
 
-## TVM Overview
+- 最终 CFG 中每个未解析块的具体原因；
+- 间接跳转表达式、符号叶子和 0/1 候选条件；
+- 候选取值后的目标、可执行属性及 VM 节归属；
+- 小范围索引的枚举结果；
+- CFG 结构校验，包括不可执行目标和 SSA 支配关系问题；
+- 表达式 DAG 的节点组成、共享程度、活节点和死亡节点规模；
+- block budget、超时、表达式膨胀与真实符号分支之间的区分。
 
-TVM replaces a native function with a trampoline into a VM dispatcher. The dispatcher executes native x86 handlers, but the protected function's architectural state lives in the VM context.
+诊断专属计算不计入恢复的超时预算，因此开启诊断不会仅仅因为统计工作较慢而改变恢复结果。工具也不会为了减少 `unresolved` 数量而强制吞掉无法证明不可达的分支。
 
-```mermaid
-flowchart TB
-    subgraph TOP[ ]
-        direction LR
-
-        subgraph TEXT[.text]
-            ENTRY["<b>Function entry</b><br/>jump to VM entry"]
-        end
-
-        subgraph VM[.tvm0 section]
-            direction LR
-            CORE["<b>Shared dispatcher and handlers</b><br/>fetch bytecode - execute - resolve next handler"]
-            CTX["<b>Guest context</b><br/>GPRs - RFLAGS - VIP"]
-            CORE <--> CTX
-        end
-    end
-
-    subgraph NATIVE[Native execution outside the VM]
-        direction LR
-        BOXED["<b>Boxed instruction</b><br/>execute original x86"]
-        CALL["<b>Guest call</b><br/>invoke native target"]
-        EXIT["<b>Guest return or tail call</b><br/>resume native execution"]
-        BOXED ~~~ CALL ~~~ EXIT
-    end
-
-    TEXT --> VM
-    VM <--> NATIVE
-
-    style TOP fill:transparent,stroke:transparent
-```
-
-Some operations execute outside the VM. A **boxed instruction** runs its original x86 encoding after the VM restores the registers it needs, then returns its effects to the guest context. A **guest call** invokes a native target and resumes with the return value and Windows x64 ABI clobbers represented in guest state. Guest returns and tail calls leave the dispatcher entirely.
-
-The context contains all sixteen guest general-purpose registers, including the guest `RSP`, plus packed guest flags. The exact context layout can vary, so the lifter identifies the guest register image by observing the VM's register save and restore behavior rather than assuming a single fixed address.
-
-Conditional control flow is implemented through dispatch arithmetic. A handler extracts a guest flag or predicate, uses it to select the next virtual program counter, and computes the address of the next native handler. The devirtualizer symbolically evaluates that process and forks the evaluator when the selected path depends on an unresolved guest value.
-
-## Project Layout
+常用参数：
 
 ```text
-src/binary/   PE parsing, disassembly, format constants
-src/vm/       VM entry discovery, state, and CFG exploration
-src/ir/       symbolic expressions, hashing, lifting, scheduling, and allocation
-src/codegen/  x86 emission, control flow, operands, frame layout, and unwind data
-src/cli/      inspection, recovery, formatting, and writeback commands
+--steps <N>       单块指令步数预算
+--max-blocks <N>  最大恢复块数，默认 512
+--timeout <SEC>   恢复超时，默认 120 秒
+--json <PATH>     将完整报告写入 JSON 文件
 ```
 
-## Limitations
+## 构建
 
-- Codegen quality is far from perfect and the output binaries are meant for analysis only.
-- Unsupported or unresolved VM behavior can leave a function incomplete.
+需要 Rust 工具链；Windows 构建还需要 Visual Studio C++ 工具链。
 
-## Credits
+```bash
+cargo build --release
+cargo test --release
+```
 
-- [k0mkc](https://k0mkc.hatenablog.com/archive/category/AntiCheatExpert)
-- [Back Engineering Labs](https://back.engineering/blog/31/07/2026/)
+其他基础命令及项目原理请参考[上游仓库](https://github.com/jz0/tvm-devirt)。
+
+## 维护关系
+
+- 原项目：[`jz0/tvm-devirt`](https://github.com/jz0/tvm-devirt)
+- 本维护镜像：[`NeuroSaki987/tvm-devirt-mirror`](https://github.com/NeuroSaki987/tvm-devirt-mirror)
+- `master` 以原项目为基线，镜像专属功能在此基础上维护。
+- 通用且适合上游的独立修复仍应拆成小型 PR 提交给原项目。
+
+---
+
+## English
+
+This is a maintained mirror of [`jz0/tvm-devirt`](https://github.com/jz0/tvm-devirt). The base devirtualizer comes from upstream; this repository focuses on additional tooling for explaining incomplete recovery.
+
+The added `unresolved` command reports final unresolved CFG blocks, failed indirect-branch expressions, candidate arms, bounded-index probes, CFG invariant violations, and expression-DAG composition. Diagnostic-only work is excluded from the recovery timeout, and the tool does not discard unproven paths merely to reduce the unresolved count.
+
+```bash
+tvm-devirt unresolved input.exe 0x140001000
+tvm-devirt unresolved input.exe 0x140001000 --json unresolved.json
+tvm-devirt unresolved input.exe 0x140001000 --max-blocks 1024
+```
+
+Build and test with:
+
+```bash
+cargo build --release
+cargo test --release
+```
+
+See the [upstream repository](https://github.com/jz0/tvm-devirt) for the original project, its architecture, and the standard commands.
