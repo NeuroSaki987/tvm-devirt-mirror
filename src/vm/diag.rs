@@ -111,6 +111,16 @@ pub struct StopDiag {
     pub site: u64,
 }
 
+/// One automatic expression-arena compaction at the node-limit boundary.
+#[derive(Clone, Debug, Default)]
+pub struct CompactionDiag {
+    pub entry: u64,
+    pub pass: u32,
+    pub site: u64,
+    pub before: usize,
+    pub after: usize,
+}
+
 /// How the expression DAG looked at the moment folding gave up.
 ///
 /// The stop carries a node count, which says growth ran away but not what grew.
@@ -157,6 +167,7 @@ pub struct Sink {
     pub final_pass: u32,
     pub splits: Vec<SplitDiag>,
     pub stops: Vec<StopDiag>,
+    pub compactions: Vec<CompactionDiag>,
     pub diverged: Vec<DivergedDiag>,
 }
 
@@ -243,6 +254,13 @@ pub fn record_stop(mut d: StopDiag) {
         return;
     }
     SINK.with(|s| s.borrow_mut().stops.push(d));
+}
+
+pub fn record_compaction(mut d: CompactionDiag) {
+    if !fill(&mut d.entry, &mut d.pass) {
+        return;
+    }
+    SINK.with(|s| s.borrow_mut().compactions.push(d));
 }
 
 pub fn record_diverged(mut d: DivergedDiag) {

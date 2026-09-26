@@ -2683,7 +2683,13 @@ impl<'a> Emulator<'a> {
                 return Stop::OutOfImage { site: ip };
             }
             if self.arena.len() > self.node_limit {
-                let (_, live) = self.compact_arena(retained);
+                let (before, live) = self.compact_arena(retained);
+                crate::vm::diag::record_compaction(crate::vm::diag::CompactionDiag {
+                    site: ip,
+                    before,
+                    after: live,
+                    ..Default::default()
+                });
                 if live > self.node_limit {
                     return Stop::Diverged {
                         site: ip,
@@ -3238,13 +3244,24 @@ mod compaction_tests {
         let mut control = compacting.clone();
         control.node_limit = usize::MAX;
         compacting.node_limit = compacting.arena.len() - 1;
+        crate::vm::diag::begin(START);
+        crate::vm::diag::set_pass(2);
 
         let control_stop = control.run(START, 1);
         let compacted_stop = compacting.run(START, 1);
+        let diagnostics = crate::vm::diag::take();
 
         assert!(matches!(control_stop, Stop::Return { .. }));
         assert!(matches!(compacted_stop, Stop::Return { .. }));
         assert!(compacting.arena.len() <= compacting.node_limit);
+        assert_eq!(diagnostics.compactions.len(), 1);
+        let record = &diagnostics.compactions[0];
+        assert_eq!(record.entry, START);
+        assert_eq!(record.pass, 2);
+        assert_eq!(record.site, START);
+        assert!(record.before > record.after);
+        assert!(record.after <= compacting.arena.len());
+        assert!(record.after <= compacting.node_limit);
     }
 
     #[test]

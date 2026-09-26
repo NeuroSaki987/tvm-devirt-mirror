@@ -239,11 +239,32 @@ fn render_json(
         s.push('}');
     }
     s.push_str("],");
+    let _ = write!(s, "\"compactions\":{},", compaction_json(&sink.compactions));
     // Kept in its own array: these describe the folding budget rather than an
     // unresolved branch, and merging the two would hide which mechanism a count
     // belongs to.
     let _ = write!(s, "\"divergence\":{}", divergence_json(&sink.diverged));
     s.push('}');
+    s
+}
+
+fn compaction_json(v: &[diag::CompactionDiag]) -> String {
+    let mut s = String::from("[");
+    for (index, d) in v.iter().enumerate() {
+        if index > 0 {
+            s.push(',');
+        }
+        let _ = write!(
+            s,
+            "{{\"entry\":{},\"pass\":{},\"site\":{},\"before\":{},\"after\":{}}}",
+            hex(d.entry),
+            d.pass,
+            hex(d.site),
+            d.before,
+            d.after
+        );
+    }
+    s.push(']');
     s
 }
 
@@ -470,5 +491,21 @@ mod tests {
         };
 
         assert!(stop_for_block(&sink, &id).is_none());
+    }
+
+    #[test]
+    fn compaction_json_preserves_site_and_node_counts() {
+        let json = compaction_json(&[diag::CompactionDiag {
+            entry: 0x140001000,
+            pass: 2,
+            site: 0x140002000,
+            before: 1_000_001,
+            after: 19_321,
+        }]);
+
+        assert_eq!(
+            json,
+            "[{\"entry\":\"0x140001000\",\"pass\":2,\"site\":\"0x140002000\",\"before\":1000001,\"after\":19321}]"
+        );
     }
 }
