@@ -164,6 +164,33 @@ impl State {
         roots
     }
 
+    /// Replace every expression reference retained by the machine state.
+    pub(crate) fn remap_refs(&mut self, remap: &HashMap<Ref, Ref>) {
+        let mapped = |r: Ref| {
+            *remap
+                .get(&r)
+                .expect("machine-state root missing from arena compaction map")
+        };
+        for value in self.regs.values_mut() {
+            *value = mapped(*value);
+        }
+        for value in self.flags.values_mut() {
+            *value = mapped(*value);
+        }
+        for byte in self.mem.values_mut() {
+            if let Byte::Sym { expr, .. } = byte {
+                *expr = mapped(*expr);
+            }
+        }
+        for (addr, value, _) in &mut self.sym_stores {
+            *addr = mapped(*addr);
+            *value = mapped(*value);
+        }
+        for value in self.xmm.values_mut() {
+            *value = mapped(*value);
+        }
+    }
+
     /// Concrete RSP, when it is one. VM exits are detected off this.
     pub fn concrete_rsp(&self, arena: &Arena) -> Option<u64> {
         arena.as_const(self.reg(Reg::Rsp))
@@ -372,5 +399,69 @@ mod root_tests {
             roots,
             HashSet::from([reg, flag, mem, store_addr, store_value, xmm])
         );
+    }
+
+    #[test]
+    fn remap_refs_updates_every_machine_state_holder() {
+        let mut arena = Arena::new();
+        let mut state = State::new(&mut arena, 0x7fff_ffff_0000);
+        let old: Vec<Ref> = (0..6)
+            .map(|_| arena.opaque("old-state-root", Width::W64))
+            .collect();
+        let new: Vec<Ref> = (0..6)
+            .map(|_| arena.opaque("new-state-root", Width::W64))
+            .collect();
+
+        state.regs.clear();
+        state.flags.clear();
+        state.mem.clear();
+        state.sym_stores.clear();
+        state.xmm.clear();
+        state.regs.insert(Reg::Rax, old[0]);
+        state.flags.insert(Flag::Zf, old[1]);
+        state.mem.insert(
+            0x1000,
+            Byte::Sym {
+                expr: old[2],
+                index: 3,
+            },
+        );
+        state
+            .sym_stores
+            .push((old[3], old[4], Width::W32));
+        state.xmm.insert((2, XmmHalf::High), old[5]);
+        let remap: HashMap<Ref, Ref> = old.iter().copied().zip(new.iter().copied()).collect();
+
+        state.remap_refs(&remap);
+
+        assert_eq!(state.regs[&Reg::Rax], new[0]);
+        assert_eq!(state.flags[&Flag::Zf], new[1]);
+        assert_eq!(
+            state.mem[&0x1000],
+            Byte::Sym {
+                expr: new[2],
+                index: 3
+            }
+        );
+        assert_eq!(state.sym_stores, vec![(new[3], new[4], Width::W32)]);
+        assert_eq!(state.xmm[&(2, XmmHalf::High)], new[5]);
+    }
+
+    #[test]
+    fn remap_refs_panics_on_a_missing_declared_root() {
+        let mut arena = Arena::new();
+        let mut state = State::new(&mut arena, 0x7fff_ffff_0000);
+        state.regs.clear();
+        state.flags.clear();
+        state.mem.clear();
+        state.sym_stores.clear();
+        state.xmm.clear();
+        state.regs.insert(Reg::Rax, arena.opaque("missing", Width::W64));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.remap_refs(&HashMap::new());
+        }));
+
+        assert!(result.is_err());
     }
 }

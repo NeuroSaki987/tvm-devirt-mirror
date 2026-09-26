@@ -184,6 +184,71 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// Append every expression reference retained by this event.
+    pub(crate) fn append_roots(&self, roots: &mut Vec<Ref>) {
+        match self {
+            Self::Store { addr, value, .. } | Self::Load { addr, value, .. } => {
+                roots.push(*addr);
+                roots.push(*value);
+            }
+            Self::Boxed {
+                mem, defs, uses, ..
+            } => {
+                if let Some(mem) = mem {
+                    roots.push(mem.addr);
+                }
+                roots.extend(defs.iter().chain(uses.iter()).map(|(_, value)| *value));
+            }
+            Self::Call {
+                target, args, ret, ..
+            } => {
+                roots.extend(target.iter().copied());
+                roots.extend(args.iter().map(|(_, value)| *value));
+                roots.extend(ret.iter().copied());
+            }
+        }
+    }
+
+    /// Replace every expression reference retained by this event.
+    pub(crate) fn remap_refs(&mut self, remap: &HashMap<Ref, Ref>) {
+        let mapped = |r: Ref| {
+            *remap
+                .get(&r)
+                .expect("event root missing from arena compaction map")
+        };
+        match self {
+            Self::Store { addr, value, .. } | Self::Load { addr, value, .. } => {
+                *addr = mapped(*addr);
+                *value = mapped(*value);
+            }
+            Self::Boxed {
+                mem, defs, uses, ..
+            } => {
+                if let Some(mem) = mem {
+                    mem.addr = mapped(mem.addr);
+                }
+                for (_, value) in defs.iter_mut().chain(uses.iter_mut()) {
+                    *value = mapped(*value);
+                }
+            }
+            Self::Call {
+                target, args, ret, ..
+            } => {
+                if let Some(target) = target {
+                    *target = mapped(*target);
+                }
+                for (_, value) in args {
+                    *value = mapped(*value);
+                }
+                if let Some(ret) = ret {
+                    *ret = mapped(*ret);
+                }
+            }
+        }
+    }
+}
+
 /// The memory operand of a boxed instruction.
 #[derive(Debug, Clone)]
 pub struct BoxedMem {
@@ -2872,6 +2937,133 @@ fn pick_vip_slot(seen: &HashMap<u64, HashSet<u64>>) -> Option<u64> {
 /// that, and `probe_pin_appended` exists so the two behaviours can be compared.
 fn first_pin(pins: &[(Ref, u64)], r: Ref) -> Option<u64> {
     pins.iter().find(|(p, _)| *p == r).map(|(_, v)| *v)
+}
+
+#[cfg(test)]
+mod event_ref_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn event_roots_and_remapping_cover_every_variant() {
+        let mut arena = Arena::new();
+        let old: Vec<Ref> = (0..10)
+            .map(|_| arena.opaque("old-event-root", Width::W64))
+            .collect();
+        let new: Vec<Ref> = (0..10)
+            .map(|_| arena.opaque("new-event-root", Width::W64))
+            .collect();
+        let mut events = vec![
+            Event::Store {
+                addr: old[0],
+                value: old[1],
+                width: Width::W64,
+                site: 1,
+                region: Region::Guest,
+            },
+            Event::Load {
+                addr: old[2],
+                value: old[3],
+                width: Width::W32,
+                site: 2,
+                region: Region::Guest,
+            },
+            Event::Boxed {
+                site: 3,
+                text: "boxed".into(),
+                bytes: vec![0x90],
+                mem: Some(BoxedMem {
+                    addr: old[4],
+                    bytes: 8,
+                    writes: true,
+                }),
+                defs: vec![(Register::RAX, old[5])],
+                uses: vec![(Register::RCX, old[6])],
+            },
+            Event::Call {
+                target: Some(old[7]),
+                site: 4,
+                rsp: Some(0x1000),
+                import_slot: None,
+                args: vec![(Reg::Rdx, old[8])],
+                ret: Some(old[9]),
+            },
+        ];
+        let mut roots = Vec::new();
+        for event in &events {
+            event.append_roots(&mut roots);
+        }
+        assert_eq!(roots.into_iter().collect::<HashSet<_>>(), old.iter().copied().collect());
+
+        let remap: HashMap<Ref, Ref> = old.iter().copied().zip(new.iter().copied()).collect();
+        for event in &mut events {
+            event.remap_refs(&remap);
+        }
+
+        match &events[0] {
+            Event::Store { addr, value, .. } => assert_eq!((*addr, *value), (new[0], new[1])),
+            _ => panic!("store event changed variant"),
+        }
+        match &events[1] {
+            Event::Load { addr, value, .. } => assert_eq!((*addr, *value), (new[2], new[3])),
+            _ => panic!("load event changed variant"),
+        }
+        match &events[2] {
+            Event::Boxed { mem, defs, uses, .. } => {
+                assert_eq!(mem.as_ref().unwrap().addr, new[4]);
+                assert_eq!(defs[0].1, new[5]);
+                assert_eq!(uses[0].1, new[6]);
+            }
+            _ => panic!("boxed event changed variant"),
+        }
+        match &events[3] {
+            Event::Call { target, args, ret, .. } => {
+                assert_eq!(*target, Some(new[7]));
+                assert_eq!(args[0].1, new[8]);
+                assert_eq!(*ret, Some(new[9]));
+            }
+            _ => panic!("call event changed variant"),
+        }
+    }
+
+    #[test]
+    fn event_remapping_handles_absent_optionals() {
+        let mut events = [
+            Event::Boxed {
+                site: 1,
+                text: "boxed".into(),
+                bytes: vec![0x90],
+                mem: None,
+                defs: Vec::new(),
+                uses: Vec::new(),
+            },
+            Event::Call {
+                target: None,
+                site: 2,
+                rsp: None,
+                import_slot: None,
+                args: Vec::new(),
+                ret: None,
+            },
+        ];
+        let mut roots = Vec::new();
+        for event in &events {
+            event.append_roots(&mut roots);
+        }
+        assert!(roots.is_empty());
+        for event in &mut events {
+            event.remap_refs(&HashMap::new());
+        }
+        assert!(matches!(&events[0], Event::Boxed { mem: None, .. }));
+        assert!(matches!(
+            &events[1],
+            Event::Call {
+                target: None,
+                ret: None,
+                ..
+            }
+        ));
+    }
 }
 
 #[cfg(test)]
