@@ -426,9 +426,7 @@ mod root_tests {
                 index: 3,
             },
         );
-        state
-            .sym_stores
-            .push((old[3], old[4], Width::W32));
+        state.sym_stores.push((old[3], old[4], Width::W32));
         state.xmm.insert((2, XmmHalf::High), old[5]);
         let remap: HashMap<Ref, Ref> = old.iter().copied().zip(new.iter().copied()).collect();
 
@@ -456,7 +454,9 @@ mod root_tests {
         state.mem.clear();
         state.sym_stores.clear();
         state.xmm.clear();
-        state.regs.insert(Reg::Rax, arena.opaque("missing", Width::W64));
+        state
+            .regs
+            .insert(Reg::Rax, arena.opaque("missing", Width::W64));
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             state.remap_refs(&HashMap::new());

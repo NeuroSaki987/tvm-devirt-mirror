@@ -63,7 +63,7 @@ mod divergence_root_tests {
 
     #[test]
     fn compaction_preserves_overwritten_block_entry_parameters_for_grafting() {
-        const IMAGE_BASE: u64 = 0x1400_0000_0;
+        const IMAGE_BASE: u64 = 0x0001_4000_0000;
         const START: u64 = IMAGE_BASE + 0x1000;
         let mut data = vec![0u8; 0x400];
         data[0x200] = 0xc3;

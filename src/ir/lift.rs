@@ -3032,7 +3032,10 @@ mod event_ref_tests {
         for event in &events {
             event.append_roots(&mut roots);
         }
-        assert_eq!(roots.into_iter().collect::<HashSet<_>>(), old.iter().copied().collect());
+        assert_eq!(
+            roots.into_iter().collect::<HashSet<_>>(),
+            old.iter().copied().collect()
+        );
 
         let remap: HashMap<Ref, Ref> = old.iter().copied().zip(new.iter().copied()).collect();
         for event in &mut events {
@@ -3048,7 +3051,9 @@ mod event_ref_tests {
             _ => panic!("load event changed variant"),
         }
         match &events[2] {
-            Event::Boxed { mem, defs, uses, .. } => {
+            Event::Boxed {
+                mem, defs, uses, ..
+            } => {
                 assert_eq!(mem.as_ref().unwrap().addr, new[4]);
                 assert_eq!(defs[0].1, new[5]);
                 assert_eq!(uses[0].1, new[6]);
@@ -3056,7 +3061,9 @@ mod event_ref_tests {
             _ => panic!("boxed event changed variant"),
         }
         match &events[3] {
-            Event::Call { target, args, ret, .. } => {
+            Event::Call {
+                target, args, ret, ..
+            } => {
                 assert_eq!(*target, Some(new[7]));
                 assert_eq!(args[0].1, new[8]);
                 assert_eq!(*ret, Some(new[9]));
@@ -3111,7 +3118,7 @@ mod compaction_tests {
     use crate::binary::pe::{PeFile, Section};
     use crate::ir::expr::BlockRef;
 
-    const IMAGE_BASE: u64 = 0x1400_0000_0;
+    const IMAGE_BASE: u64 = 0x0001_4000_0000;
     const START: u64 = IMAGE_BASE + 0x1000;
 
     fn executable_pe(code: &[u8]) -> PeFile {
@@ -3175,10 +3182,7 @@ mod compaction_tests {
             emu.pins[0].0,
             retained[0],
         ];
-        assert_eq!(
-            remapped.map(|r| emu.arena.structural_hash(r, 8)),
-            hashes
-        );
+        assert_eq!(remapped.map(|r| emu.arena.structural_hash(r, 8)), hashes);
         for root in remapped {
             let _ = emu.arena.op(root);
         }
@@ -3283,7 +3287,10 @@ mod compaction_tests {
 
         assert!(matches!(stop, Stop::Return { .. }));
         assert_eq!(emu.arena.structural_hash(retained[0], 8), before_hash);
-        assert_eq!(emu.arena.op(retained[0]), &Op::Param(BlockRef(11), Reg::R12));
+        assert_eq!(
+            emu.arena.op(retained[0]),
+            &Op::Param(BlockRef(11), Reg::R12)
+        );
     }
 }
 
