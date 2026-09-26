@@ -1,5 +1,5 @@
-//! Hash-consed expression DAG for guest (symbolic) semantics. 
-//! The whole devirtualization strategy rests on one observation: 
+//! Hash-consed expression DAG for guest (symbolic) semantics.
+//! The whole devirtualization strategy rests on one observation:
 //! everything the VM needs in order to dispatch depends only on image constants, the initial (concretized) RSP and the VIP.
 
 use std::collections::{HashMap, HashSet};
@@ -501,6 +501,118 @@ impl Arena {
         n
     }
 
+    /// Rebuild the arena from the exact transitive closure of `roots`.
+    ///
+    /// Nodes are copied directly rather than reconstructed through simplifying
+    /// constructors. The returned map is therefore the only operation callers
+    /// need to update every retained [`Ref`] after compaction.
+    pub fn compact(&mut self, roots: &[Ref]) -> HashMap<Ref, Ref> {
+        for &root in roots {
+            assert!(
+                root.index() < self.nodes.len(),
+                "arena compaction root {} is out of range for {} nodes",
+                root.index(),
+                self.nodes.len()
+            );
+        }
+
+        // 0 = unseen, 1 = on the explicit DFS stack, 2 = ordered. The arena is
+        // a DAG, but tracking the middle state turns an internal cycle into an
+        // immediate invariant failure rather than an infinite traversal.
+        let mut state = vec![0u8; self.nodes.len()];
+        let mut order = Vec::new();
+        for &root in roots {
+            if state[root.index()] == 2 {
+                continue;
+            }
+            let mut stack = vec![(root, false)];
+            while let Some((r, expanded)) = stack.pop() {
+                let index = r.index();
+                if expanded {
+                    if state[index] != 2 {
+                        state[index] = 2;
+                        order.push(r);
+                    }
+                    continue;
+                }
+                match state[index] {
+                    2 => continue,
+                    1 => panic!("expression arena contains a cycle at ref {index}"),
+                    _ => state[index] = 1,
+                }
+                stack.push((r, true));
+                let mut push = |child: Ref| {
+                    assert!(
+                        child.index() < self.nodes.len(),
+                        "arena node {index} has out-of-range child {}",
+                        child.index()
+                    );
+                    if state[child.index()] != 2 {
+                        stack.push((child, false));
+                    }
+                };
+                match &self.nodes[index].op {
+                    Op::Bin(_, x, y) => {
+                        push(*y);
+                        push(*x);
+                    }
+                    Op::Un(_, x) | Op::Zext(x) | Op::Sext(x) | Op::Trunc(x) => push(*x),
+                    Op::Load(addr, _) => push(*addr),
+                    Op::Select(cond, x, y) => {
+                        push(*y);
+                        push(*x);
+                        push(*cond);
+                    }
+                    Op::Const(_) | Op::InitReg(_) | Op::Opaque(_, _) | Op::Param(_, _) => {}
+                }
+            }
+        }
+
+        let mut nodes = Vec::with_capacity(order.len());
+        let mut intern = HashMap::with_capacity(order.len());
+        let mut remap = HashMap::with_capacity(order.len());
+        for old_ref in order {
+            let old = &self.nodes[old_ref.index()];
+            let mapped = |r: Ref| {
+                *remap
+                    .get(&r)
+                    .expect("arena compaction ordered a parent before its child")
+            };
+            let op = match &old.op {
+                Op::Const(value) => Op::Const(*value),
+                Op::InitReg(reg) => Op::InitReg(*reg),
+                Op::Load(addr, generation) => Op::Load(mapped(*addr), *generation),
+                Op::Bin(op, x, y) => Op::Bin(*op, mapped(*x), mapped(*y)),
+                Op::Un(op, x) => Op::Un(*op, mapped(*x)),
+                Op::Zext(x) => Op::Zext(mapped(*x)),
+                Op::Sext(x) => Op::Sext(mapped(*x)),
+                Op::Trunc(x) => Op::Trunc(mapped(*x)),
+                Op::Select(cond, x, y) => Op::Select(mapped(*cond), mapped(*x), mapped(*y)),
+                Op::Opaque(tag, id) => Op::Opaque(tag, *id),
+                Op::Param(block, reg) => Op::Param(*block, *reg),
+            };
+            let node = Node {
+                op,
+                width: old.width,
+            };
+            let new_ref = if let Some(&existing) = intern.get(&node) {
+                existing
+            } else {
+                let new_ref = Ref::from_index(nodes.len());
+                nodes.push(node.clone());
+                intern.insert(node, new_ref);
+                new_ref
+            };
+            remap.insert(old_ref, new_ref);
+        }
+
+        self.nodes = nodes;
+        self.intern = intern;
+        self.known_zero.clear();
+        self.known_one.clear();
+        remap
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -976,8 +1088,8 @@ impl Arena {
             _ => {}
         }
 
-        // Push truncation through operations whose low bits depend only on the low bits of their operands. 
-        // This is the single most valuable canonicalization for TVM: 
+        // Push truncation through operations whose low bits depend only on the low bits of their operands.
+        // This is the single most valuable canonicalization for TVM:
         // the VM constantly builds a 16-bit bytecode index as `(guest_reg & 0xffff_ffff_ffff_0000) | imm16` and then reads it back with `movzx`.
         if let Op::Bin(op, x, y) = *self.op(r) {
             if matches!(
@@ -2370,7 +2482,10 @@ mod tests {
         a.note_concrete_store(0x1400_7f10_8, 8);
         let after = a.load(global, Width::W64);
 
-        assert_ne!(before, after, "a store to the cell did not separate the loads");
+        assert_ne!(
+            before, after,
+            "a store to the cell did not separate the loads"
+        );
     }
 
     /// ... including a store that only partly covers the cell, or a narrower
@@ -2415,7 +2530,10 @@ mod tests {
         a.note_concrete_store(0x1400_7f10_8, 8);
         let after = a.load(addr, Width::W8);
 
-        assert_ne!(before, after, "a symbolic address load ignored the generation");
+        assert_ne!(
+            before, after,
+            "a symbolic address load ignored the generation"
+        );
     }
 
     /// Rebuilding an existing load must keep its generation. `graft` and
@@ -2761,6 +2879,173 @@ mod tests {
         let h1 = dst.graft(&src, o, &mut HashMap::new());
         let h2 = dst.graft(&src, o, &mut HashMap::new());
         assert_ne!(h1, h2, "a counted opaque must be reissued per graft");
+    }
+
+    #[test]
+    fn compact_removes_unreachable_nodes_and_preserves_structure() {
+        let mut a = Arena::new();
+        for _ in 0..32 {
+            a.opaque("dead", Width::W64);
+        }
+        let x = a.init_reg(Reg::Rax);
+        let c = a.constant(0x1234, Width::W64);
+        let root = a.bin(BinOp::Xor, x, c);
+        let before_len = a.len();
+        let before_hash = a.structural_hash(root, 16);
+
+        let remap = a.compact(&[root]);
+        let root = remap[&root];
+
+        assert_eq!(a.len(), 3);
+        assert!(a.len() < before_len);
+        assert_eq!(a.structural_hash(root, 16), before_hash);
+        assert_eq!(a.reachable_from(&[root]), a.len());
+    }
+
+    #[test]
+    fn compact_preserves_shared_children_and_exact_node_identity() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rax);
+        let y = a.param(BlockRef(7), Reg::R12);
+        let shared = a.intern(Node {
+            op: Op::Bin(BinOp::Xor, x, y),
+            width: Width::W64,
+        });
+        let loaded = a.load_at(shared, Width::W32, 77);
+        let undef = a.undef("shared-undef", Width::W32);
+        let root = a.intern(Node {
+            op: Op::Bin(BinOp::Add, loaded, undef),
+            width: Width::W32,
+        });
+        let second = a.intern(Node {
+            op: Op::Bin(BinOp::Sub, shared, x),
+            width: Width::W64,
+        });
+
+        let remap = a.compact(&[root, second]);
+        let root_new = remap[&root];
+        let second_new = remap[&second];
+        let shared_new = remap[&shared];
+
+        assert_eq!(
+            a.op(remap[&loaded]),
+            &Op::Load(shared_new, 77),
+            "load generation changed"
+        );
+        assert_eq!(a.op(remap[&y]), &Op::Param(BlockRef(7), Reg::R12));
+        assert_eq!(
+            a.op(remap[&undef]),
+            &Op::Opaque("shared-undef", 0),
+            "shared undef identity changed"
+        );
+        assert_eq!(
+            a.op(root_new),
+            &Op::Bin(BinOp::Add, remap[&loaded], remap[&undef])
+        );
+        assert_eq!(
+            a.op(second_new),
+            &Op::Bin(BinOp::Sub, shared_new, remap[&x])
+        );
+    }
+
+    #[test]
+    fn compact_preserves_identity_generations_and_future_construction() {
+        let mut a = Arena::new();
+        let _dead = a.opaque("dead-counted", Width::W64);
+        let live_opaque = a.opaque("live-counted", Width::W64);
+        let address = a.constant(0x1400_1000, Width::W64);
+        a.bump_mem_gen();
+        a.note_concrete_store(0x1400_1000, 8);
+        a.note_symbolic_store();
+        let load = a.load(address, Width::W64);
+        let root = a.intern(Node {
+            op: Op::Bin(BinOp::Xor, live_opaque, load),
+            width: Width::W64,
+        });
+        a.trunc_depth = 3;
+        let _ = a.known_zero(root);
+        let _ = a.known_one(root);
+        let before_counter = a.opaque_counter;
+        let before_mem_gen = a.mem_gen;
+        let before_sym_write_gen = a.sym_write_gen;
+        let before_concrete_gen = a.concrete_gen.clone();
+
+        let remap = a.compact(&[root]);
+
+        assert_eq!(a.opaque_counter, before_counter);
+        assert_eq!(a.mem_gen, before_mem_gen);
+        assert_eq!(a.sym_write_gen, before_sym_write_gen);
+        assert_eq!(a.concrete_gen, before_concrete_gen);
+        assert_eq!(a.trunc_depth, 3);
+        assert!(a.known_zero.is_empty());
+        assert!(a.known_one.is_empty());
+        assert_eq!(a.op(remap[&live_opaque]), &Op::Opaque("live-counted", 2));
+
+        let next = a.opaque("future-counted", Width::W64);
+        assert_eq!(a.op(next), &Op::Opaque("future-counted", 3));
+        assert_eq!(a.load(remap[&address], Width::W64), remap[&load]);
+        a.bump_mem_gen();
+        a.note_concrete_store(0x1400_1000, 8);
+        let later = a.load(remap[&address], Width::W64);
+        assert_ne!(later, remap[&load]);
+        assert_eq!(a.op(later), &Op::Load(remap[&address], 2));
+    }
+
+    #[test]
+    fn compact_handles_empty_and_duplicate_roots() {
+        let mut original = Arena::new();
+        let x = original.init_reg(Reg::Rax);
+        let one = original.constant(1, Width::W64);
+        let root = original.intern(Node {
+            op: Op::Bin(BinOp::Add, x, one),
+            width: Width::W64,
+        });
+
+        let mut empty = original.clone();
+        let empty_map = empty.compact(&[]);
+        assert!(empty_map.is_empty());
+        assert_eq!(empty.len(), 0);
+
+        let mut duplicate = original;
+        let remap = duplicate.compact(&[root, root, root]);
+        assert_eq!(duplicate.len(), 3);
+        assert_eq!(remap.len(), 3);
+        assert_eq!(duplicate.reachable_from(&[remap[&root]]), 3);
+    }
+
+    #[test]
+    fn compact_rejects_invalid_roots_without_mutating_arena() {
+        let mut a = Arena::new();
+        let root = a.init_reg(Reg::Rax);
+        let before_nodes = a.nodes.clone();
+        let before_intern = a.intern.clone();
+        let invalid = Ref::from_index(a.len() + 4);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            a.compact(&[root, invalid]);
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(a.nodes, before_nodes);
+        assert_eq!(a.intern, before_intern);
+    }
+
+    #[test]
+    fn compact_handles_a_deep_dag_iteratively() {
+        let mut a = Arena::new();
+        let mut root = a.init_reg(Reg::Rax);
+        for generation in 0..50_000u32 {
+            root = a.intern(Node {
+                op: Op::Load(root, generation),
+                width: Width::W64,
+            });
+        }
+
+        let remap = a.compact(&[root]);
+        let root = remap[&root];
+
+        assert_eq!(a.len(), 50_001);
+        assert_eq!(a.reachable_from(&[root]), 50_001);
     }
 
     /// Brute-force semantic check of two expressions over random assignments to
