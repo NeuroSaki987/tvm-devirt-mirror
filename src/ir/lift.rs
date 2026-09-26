@@ -394,6 +394,10 @@ pub struct Emulator<'a> {
     pub vip_slot: Option<u64>,
 }
 
+/// Recursive expression analyses still used by instruction folding must remain
+/// comfortably inside the 1 MiB Windows main-thread stack after compaction.
+const MAX_SAFE_LIVE_DAG_DEPTH: usize = 2_048;
+
 impl<'a> Emulator<'a> {
     pub fn new(pe: &'a PeFile, stack_base: u64) -> Self {
         Self::with_vm_section(pe, stack_base, ".tvm0")
@@ -2635,7 +2639,7 @@ impl<'a> Emulator<'a> {
     }
 
     /// Reclaim unreachable expression history and update every retained ref.
-    fn compact_arena(&mut self, retained: &mut [Ref]) -> (usize, usize) {
+    fn compact_arena(&mut self, retained: &mut [Ref]) -> (usize, usize, usize) {
         let before = self.arena.len();
         let mut roots = self.state.symbolic_roots();
         roots.extend(self.pins.iter().map(|(root, _)| *root));
@@ -2645,6 +2649,7 @@ impl<'a> Emulator<'a> {
         roots.extend(retained.iter().copied());
 
         let remap = self.arena.compact(&roots);
+        let max_depth = self.arena.last_compaction_max_depth();
         self.state.remap_refs(&remap);
         for event in &mut self.events {
             event.remap_refs(&remap);
@@ -2662,7 +2667,7 @@ impl<'a> Emulator<'a> {
         self.subst_memo.clear();
         self.pin_dep.clear();
         self.memo_pin_count = self.pins.len();
-        (before, self.arena.len())
+        (before, self.arena.len(), max_depth)
     }
 
     /// Run until evaluation stops or the budget runs out.
@@ -2683,14 +2688,15 @@ impl<'a> Emulator<'a> {
                 return Stop::OutOfImage { site: ip };
             }
             if self.arena.len() > self.node_limit {
-                let (before, live) = self.compact_arena(retained);
+                let (before, live, max_depth) = self.compact_arena(retained);
                 crate::vm::diag::record_compaction(crate::vm::diag::CompactionDiag {
                     site: ip,
                     before,
                     after: live,
+                    max_depth,
                     ..Default::default()
                 });
-                if live > self.node_limit {
+                if live > self.node_limit || max_depth > MAX_SAFE_LIVE_DAG_DEPTH {
                     return Stop::Diverged {
                         site: ip,
                         nodes: live,
@@ -3229,7 +3235,8 @@ mod compaction_tests {
 
         let counts = emu.compact_arena(&mut []);
 
-        assert_eq!(counts, (expected_before, expected_after));
+        assert_eq!((counts.0, counts.1), (expected_before, expected_after));
+        assert!(counts.2 > 0);
         assert_eq!(emu.arena.len(), expected_after);
         assert!(expected_after < expected_before);
     }
@@ -3283,6 +3290,31 @@ mod compaction_tests {
         assert_eq!(site, START);
         assert_eq!(nodes, emu.arena.len());
         assert!(nodes > emu.node_limit);
+    }
+
+    #[test]
+    fn run_diverges_before_resuming_an_unsafe_live_dag_depth() {
+        let pe = executable_pe(&[0xc3]);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        let mut live = emu.state.reg(Reg::Rax);
+        for generation in 0..MAX_SAFE_LIVE_DAG_DEPTH as u32 {
+            live = emu.arena.load_at(live, Width::W64, generation);
+        }
+        emu.state.set_reg(Reg::Rax, live);
+        let live_nodes = emu.arena.reachable_from(&emu.state.symbolic_roots());
+        for _ in 0..live_nodes {
+            emu.arena.opaque("dead-history", Width::W64);
+        }
+        emu.node_limit = live_nodes + 128;
+
+        let stop = emu.run(START, 1);
+
+        let Stop::Diverged { site, nodes } = stop else {
+            panic!("an evaluator-unsafe live DAG depth resumed execution")
+        };
+        assert_eq!(site, START);
+        assert_eq!(nodes, emu.arena.len());
+        assert!(nodes <= emu.node_limit, "node count should fit the limit");
     }
 
     #[test]

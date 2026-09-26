@@ -256,12 +256,13 @@ fn compaction_json(v: &[diag::CompactionDiag]) -> String {
         }
         let _ = write!(
             s,
-            "{{\"entry\":{},\"pass\":{},\"site\":{},\"before\":{},\"after\":{}}}",
+            "{{\"entry\":{},\"pass\":{},\"site\":{},\"before\":{},\"after\":{},\"max_depth\":{}}}",
             hex(d.entry),
             d.pass,
             hex(d.site),
             d.before,
-            d.after
+            d.after,
+            d.max_depth
         );
     }
     s.push(']');
@@ -501,11 +502,12 @@ mod tests {
             site: 0x140002000,
             before: 1_000_001,
             after: 19_321,
+            max_depth: 517,
         }]);
 
         assert_eq!(
             json,
-            "[{\"entry\":\"0x140001000\",\"pass\":2,\"site\":\"0x140002000\",\"before\":1000001,\"after\":19321}]"
+            "[{\"entry\":\"0x140001000\",\"pass\":2,\"site\":\"0x140002000\",\"before\":1000001,\"after\":19321,\"max_depth\":517}]"
         );
     }
 }

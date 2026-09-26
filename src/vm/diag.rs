@@ -119,6 +119,7 @@ pub struct CompactionDiag {
     pub site: u64,
     pub before: usize,
     pub after: usize,
+    pub max_depth: usize,
 }
 
 /// How the expression DAG looked at the moment folding gave up.

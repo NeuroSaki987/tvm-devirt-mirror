@@ -336,6 +336,8 @@ pub struct Arena {
     known_one: HashMap<Ref, u64>,
     /// Current nesting depth of truncation distribution.
     trunc_depth: u32,
+    /// Maximum retained DAG depth measured by the most recent compaction.
+    last_compaction_max_depth: usize,
 }
 
 /// How many levels `trunc` is pushed through arithmetic before it is left in
@@ -356,6 +358,7 @@ impl Clone for Arena {
             known_zero: HashMap::new(),
             known_one: HashMap::new(),
             trunc_depth: self.trunc_depth,
+            last_compaction_max_depth: 0,
         }
     }
 }
@@ -507,6 +510,13 @@ impl Arena {
     /// constructors. The returned map is therefore the only operation callers
     /// need to update every retained [`Ref`] after compaction.
     pub fn compact(&mut self, roots: &[Ref]) -> HashMap<Ref, Ref> {
+        let (remap, max_depth) = self.compact_with_max_depth(roots);
+        self.last_compaction_max_depth = max_depth;
+        remap
+    }
+
+    /// Compact and also return the maximum depth of the retained DAG.
+    fn compact_with_max_depth(&mut self, roots: &[Ref]) -> (HashMap<Ref, Ref>, usize) {
         for &root in roots {
             assert!(
                 root.index() < self.nodes.len(),
@@ -571,8 +581,25 @@ impl Arena {
         let mut nodes = Vec::with_capacity(order.len());
         let mut intern = HashMap::with_capacity(order.len());
         let mut remap = HashMap::with_capacity(order.len());
+        let mut depths = vec![0usize; self.nodes.len()];
+        let mut max_depth = 0usize;
         for old_ref in order {
             let old = &self.nodes[old_ref.index()];
+            let depth = match &old.op {
+                Op::Const(_) | Op::InitReg(_) | Op::Opaque(_, _) | Op::Param(_, _) => 1,
+                Op::Load(child, _)
+                | Op::Un(_, child)
+                | Op::Zext(child)
+                | Op::Sext(child)
+                | Op::Trunc(child) => depths[child.index()].saturating_add(1),
+                Op::Bin(_, x, y) => depths[x.index()].max(depths[y.index()]).saturating_add(1),
+                Op::Select(cond, x, y) => depths[cond.index()]
+                    .max(depths[x.index()])
+                    .max(depths[y.index()])
+                    .saturating_add(1),
+            };
+            depths[old_ref.index()] = depth;
+            max_depth = max_depth.max(depth);
             let mapped = |r: Ref| {
                 *remap
                     .get(&r)
@@ -610,7 +637,11 @@ impl Arena {
         self.intern = intern;
         self.known_zero.clear();
         self.known_one.clear();
-        remap
+        (remap, max_depth)
+    }
+
+    pub(crate) fn last_compaction_max_depth(&self) -> usize {
+        self.last_compaction_max_depth
     }
 
     pub fn len(&self) -> usize {
