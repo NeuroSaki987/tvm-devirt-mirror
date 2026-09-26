@@ -2,7 +2,7 @@
 
 use crate::binary::pe::PeFile;
 use crate::ir::expr::render;
-use crate::ir::expr::{self, Arena, Op, Ref, Width};
+use crate::ir::expr::{self, Arena, Op, Ref, Reg, Width};
 use crate::ir::lift::{Emulator, Event, Stop};
 use crate::ir::{Block, BlockId, Cfg, Terminator, terminator_kind};
 use std::collections::{HashMap, HashSet};
@@ -22,9 +22,25 @@ struct Task<'a> {
     ancestors: Vec<BlockId>,
 }
 
+/// Run a block while keeping its entry parameters valid across arena compaction.
+fn run_retaining_entry_params(
+    emu: &mut Emulator<'_>,
+    start: u64,
+    budget: usize,
+    entry_params: &mut [(Reg, Ref)],
+) -> Stop {
+    let mut retained: Vec<Ref> = entry_params.iter().map(|(_, value)| *value).collect();
+    let stop = emu.run_retaining(start, budget, &mut retained);
+    for ((_, value), remapped) in entry_params.iter_mut().zip(retained) {
+        *value = remapped;
+    }
+    stop
+}
+
 #[cfg(test)]
 mod divergence_root_tests {
     use super::*;
+    use crate::binary::pe::Section;
     use crate::ir::expr::{Arena, Reg, Width};
     use crate::vm::state::State;
     use std::collections::HashSet;
@@ -43,6 +59,61 @@ mod divergence_root_tests {
             .collect();
         assert!(roots.contains(&reg));
         assert!(roots.contains(&pin));
+    }
+
+    #[test]
+    fn compaction_preserves_overwritten_block_entry_parameters_for_grafting() {
+        const IMAGE_BASE: u64 = 0x1400_0000_0;
+        const START: u64 = IMAGE_BASE + 0x1000;
+        let mut data = vec![0u8; 0x400];
+        data[0x200] = 0xc3;
+        let pe = PeFile {
+            data,
+            image_base: IMAGE_BASE,
+            entry_point_rva: 0x1000,
+            size_of_image: 0x2000,
+            sections: vec![Section {
+                name: ".text".into(),
+                virtual_address: 0x1000,
+                virtual_size: 0x100,
+                raw_address: 0x200,
+                raw_size: 0x100,
+                characteristics: 0x2000_0000,
+            }],
+            opt_header_offset: 0,
+            section_table_offset: 0,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+            size_of_headers: 0x200,
+            loader_bound: Vec::new(),
+        };
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        let parameter = emu.arena.param(expr::BlockRef(4), Reg::R12);
+        let mut entry_params = vec![(Reg::R12, parameter)];
+        emu.state.set_reg(Reg::R12, parameter);
+        let replacement = emu.arena.constant(7, Width::W64);
+        emu.state.set_reg(Reg::R12, replacement);
+        for _ in 0..64 {
+            emu.arena.opaque("dead-history", Width::W64);
+        }
+        emu.node_limit = emu.arena.len() - 1;
+        let before_hash = emu.arena.structural_hash(parameter, 8);
+
+        let stop = run_retaining_entry_params(&mut emu, START, 1, &mut entry_params);
+
+        assert!(matches!(stop, Stop::Return { .. }));
+        let remapped = entry_params[0].1;
+        assert_eq!(emu.arena.structural_hash(remapped, 8), before_hash);
+        assert_eq!(
+            emu.arena.op(remapped),
+            &Op::Param(expr::BlockRef(4), Reg::R12)
+        );
+        let mut cfg_arena = Arena::new();
+        let grafted = cfg_arena.graft(&emu.arena, remapped, &mut HashMap::new());
+        assert_eq!(
+            cfg_arena.op(grafted),
+            &Op::Param(expr::BlockRef(4), Reg::R12)
+        );
     }
 }
 
@@ -233,13 +304,18 @@ impl<'a> Explorer<'a> {
             task.emu.begin_block();
             // Replace the guest register image with this block's SSA parameters before any of its instructions run, so everything the block computes is expressed in terms of its own entry state rather than reaching back to function entry through whichever single path got here.
             let block_ref = expr::BlockRef(blocks.len() as u32);
-            let entry_params = if cut_at.contains(&task.id) {
+            let mut entry_params = if cut_at.contains(&task.id) {
                 task.emu.seed_guest_params(block_ref)
             } else {
                 Vec::new()
             };
 
-            let stop = task.emu.run(task.resume, self.step_budget);
+            let stop = run_retaining_entry_params(
+                &mut task.emu,
+                task.resume,
+                self.step_budget,
+                &mut entry_params,
+            );
             // Recorded before `stop` is consumed below.
             let returning = matches!(stop, Stop::Return { .. });
             let cost = task.emu.steps - before;
@@ -1031,27 +1107,7 @@ fn divergence_roots(
     let mut roots = state.symbolic_roots();
     roots.extend(pins.iter().map(|(expr, _)| *expr));
     for event in events {
-        match event {
-            Event::Store { addr, value, .. } | Event::Load { addr, value, .. } => {
-                roots.push(*addr);
-                roots.push(*value);
-            }
-            Event::Boxed {
-                mem, defs, uses, ..
-            } => {
-                if let Some(mem) = mem {
-                    roots.push(mem.addr);
-                }
-                roots.extend(defs.iter().chain(uses.iter()).map(|(_, expr)| *expr));
-            }
-            Event::Call {
-                target, ret, args, ..
-            } => {
-                roots.extend(target.iter().copied());
-                roots.extend(ret.iter().copied());
-                roots.extend(args.iter().map(|(_, expr)| *expr));
-            }
-        }
+        event.append_roots(&mut roots);
     }
     roots
 }
