@@ -184,6 +184,71 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// Append every expression reference retained by this event.
+    pub(crate) fn append_roots(&self, roots: &mut Vec<Ref>) {
+        match self {
+            Self::Store { addr, value, .. } | Self::Load { addr, value, .. } => {
+                roots.push(*addr);
+                roots.push(*value);
+            }
+            Self::Boxed {
+                mem, defs, uses, ..
+            } => {
+                if let Some(mem) = mem {
+                    roots.push(mem.addr);
+                }
+                roots.extend(defs.iter().chain(uses.iter()).map(|(_, value)| *value));
+            }
+            Self::Call {
+                target, args, ret, ..
+            } => {
+                roots.extend(target.iter().copied());
+                roots.extend(args.iter().map(|(_, value)| *value));
+                roots.extend(ret.iter().copied());
+            }
+        }
+    }
+
+    /// Replace every expression reference retained by this event.
+    pub(crate) fn remap_refs(&mut self, remap: &HashMap<Ref, Ref>) {
+        let mapped = |r: Ref| {
+            *remap
+                .get(&r)
+                .expect("event root missing from arena compaction map")
+        };
+        match self {
+            Self::Store { addr, value, .. } | Self::Load { addr, value, .. } => {
+                *addr = mapped(*addr);
+                *value = mapped(*value);
+            }
+            Self::Boxed {
+                mem, defs, uses, ..
+            } => {
+                if let Some(mem) = mem {
+                    mem.addr = mapped(mem.addr);
+                }
+                for (_, value) in defs.iter_mut().chain(uses.iter_mut()) {
+                    *value = mapped(*value);
+                }
+            }
+            Self::Call {
+                target, args, ret, ..
+            } => {
+                if let Some(target) = target {
+                    *target = mapped(*target);
+                }
+                for (_, value) in args {
+                    *value = mapped(*value);
+                }
+                if let Some(ret) = ret {
+                    *ret = mapped(*ret);
+                }
+            }
+        }
+    }
+}
+
 /// The memory operand of a boxed instruction.
 #[derive(Debug, Clone)]
 pub struct BoxedMem {
@@ -328,6 +393,10 @@ pub struct Emulator<'a> {
     pub guest_layout: Option<Layout>,
     pub vip_slot: Option<u64>,
 }
+
+/// Recursive expression analyses still used by instruction folding must remain
+/// comfortably inside the 1 MiB Windows main-thread stack after compaction.
+const MAX_SAFE_LIVE_DAG_DEPTH: usize = 2_048;
 
 impl<'a> Emulator<'a> {
     pub fn new(pe: &'a PeFile, stack_base: u64) -> Self {
@@ -2569,23 +2638,70 @@ impl<'a> Emulator<'a> {
         ret
     }
 
+    /// Reclaim unreachable expression history and update every retained ref.
+    fn compact_arena(&mut self, retained: &mut [Ref]) -> (usize, usize, usize) {
+        let before = self.arena.len();
+        let mut roots = self.state.symbolic_roots();
+        roots.extend(self.pins.iter().map(|(root, _)| *root));
+        for event in &self.events {
+            event.append_roots(&mut roots);
+        }
+        roots.extend(retained.iter().copied());
+
+        let remap = self.arena.compact(&roots);
+        let max_depth = self.arena.last_compaction_max_depth();
+        self.state.remap_refs(&remap);
+        for event in &mut self.events {
+            event.remap_refs(&remap);
+        }
+        for (root, _) in &mut self.pins {
+            *root = *remap
+                .get(root)
+                .expect("pin root missing from arena compaction map");
+        }
+        for root in retained {
+            *root = *remap
+                .get(root)
+                .expect("retained root missing from arena compaction map");
+        }
+        self.subst_memo.clear();
+        self.pin_dep.clear();
+        self.memo_pin_count = self.pins.len();
+        (before, self.arena.len(), max_depth)
+    }
+
     /// Run until evaluation stops or the budget runs out.
     pub fn run(&mut self, start: u64, budget: usize) -> Stop {
+        self.run_retaining(start, budget, &mut [])
+    }
+
+    /// Run while preserving expression references owned by the caller.
+    pub(crate) fn run_retaining(
+        &mut self,
+        start: u64,
+        budget: usize,
+        retained: &mut [Ref],
+    ) -> Stop {
         let mut ip = start;
         for _ in 0..budget {
             if self.pe.section_for_va(ip).is_none() {
                 return Stop::OutOfImage { site: ip };
             }
-            // Runaway DAG growth usually means constant folding has stopped working
-            // (typically because a value the VM relies on never became concrete).
-            // Continuing from here costs time without producing a usable result, and
-            // the expressions get large enough to make every subsequent
-            // simplification pass slow.
             if self.arena.len() > self.node_limit {
-                return Stop::Diverged {
+                let (before, live, max_depth) = self.compact_arena(retained);
+                crate::vm::diag::record_compaction(crate::vm::diag::CompactionDiag {
                     site: ip,
-                    nodes: self.arena.len(),
-                };
+                    before,
+                    after: live,
+                    max_depth,
+                    ..Default::default()
+                });
+                if live > self.node_limit || max_depth > MAX_SAFE_LIVE_DAG_DEPTH {
+                    return Stop::Diverged {
+                        site: ip,
+                        nodes: live,
+                    };
+                }
             }
             match self.step(ip) {
                 Step::Next(n) => ip = n,
@@ -2872,6 +2988,359 @@ fn pick_vip_slot(seen: &HashMap<u64, HashSet<u64>>) -> Option<u64> {
 /// that, and `probe_pin_appended` exists so the two behaviours can be compared.
 fn first_pin(pins: &[(Ref, u64)], r: Ref) -> Option<u64> {
     pins.iter().find(|(p, _)| *p == r).map(|(_, v)| *v)
+}
+
+#[cfg(test)]
+mod event_ref_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn event_roots_and_remapping_cover_every_variant() {
+        let mut arena = Arena::new();
+        let old: Vec<Ref> = (0..10)
+            .map(|_| arena.opaque("old-event-root", Width::W64))
+            .collect();
+        let new: Vec<Ref> = (0..10)
+            .map(|_| arena.opaque("new-event-root", Width::W64))
+            .collect();
+        let mut events = vec![
+            Event::Store {
+                addr: old[0],
+                value: old[1],
+                width: Width::W64,
+                site: 1,
+                region: Region::Guest,
+            },
+            Event::Load {
+                addr: old[2],
+                value: old[3],
+                width: Width::W32,
+                site: 2,
+                region: Region::Guest,
+            },
+            Event::Boxed {
+                site: 3,
+                text: "boxed".into(),
+                bytes: vec![0x90],
+                mem: Some(BoxedMem {
+                    addr: old[4],
+                    bytes: 8,
+                    writes: true,
+                }),
+                defs: vec![(Register::RAX, old[5])],
+                uses: vec![(Register::RCX, old[6])],
+            },
+            Event::Call {
+                target: Some(old[7]),
+                site: 4,
+                rsp: Some(0x1000),
+                import_slot: None,
+                args: vec![(Reg::Rdx, old[8])],
+                ret: Some(old[9]),
+            },
+        ];
+        let mut roots = Vec::new();
+        for event in &events {
+            event.append_roots(&mut roots);
+        }
+        assert_eq!(
+            roots.into_iter().collect::<HashSet<_>>(),
+            old.iter().copied().collect()
+        );
+
+        let remap: HashMap<Ref, Ref> = old.iter().copied().zip(new.iter().copied()).collect();
+        for event in &mut events {
+            event.remap_refs(&remap);
+        }
+
+        match &events[0] {
+            Event::Store { addr, value, .. } => assert_eq!((*addr, *value), (new[0], new[1])),
+            _ => panic!("store event changed variant"),
+        }
+        match &events[1] {
+            Event::Load { addr, value, .. } => assert_eq!((*addr, *value), (new[2], new[3])),
+            _ => panic!("load event changed variant"),
+        }
+        match &events[2] {
+            Event::Boxed {
+                mem, defs, uses, ..
+            } => {
+                assert_eq!(mem.as_ref().unwrap().addr, new[4]);
+                assert_eq!(defs[0].1, new[5]);
+                assert_eq!(uses[0].1, new[6]);
+            }
+            _ => panic!("boxed event changed variant"),
+        }
+        match &events[3] {
+            Event::Call {
+                target, args, ret, ..
+            } => {
+                assert_eq!(*target, Some(new[7]));
+                assert_eq!(args[0].1, new[8]);
+                assert_eq!(*ret, Some(new[9]));
+            }
+            _ => panic!("call event changed variant"),
+        }
+    }
+
+    #[test]
+    fn event_remapping_handles_absent_optionals() {
+        let mut events = [
+            Event::Boxed {
+                site: 1,
+                text: "boxed".into(),
+                bytes: vec![0x90],
+                mem: None,
+                defs: Vec::new(),
+                uses: Vec::new(),
+            },
+            Event::Call {
+                target: None,
+                site: 2,
+                rsp: None,
+                import_slot: None,
+                args: Vec::new(),
+                ret: None,
+            },
+        ];
+        let mut roots = Vec::new();
+        for event in &events {
+            event.append_roots(&mut roots);
+        }
+        assert!(roots.is_empty());
+        for event in &mut events {
+            event.remap_refs(&HashMap::new());
+        }
+        assert!(matches!(&events[0], Event::Boxed { mem: None, .. }));
+        assert!(matches!(
+            &events[1],
+            Event::Call {
+                target: None,
+                ret: None,
+                ..
+            }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use crate::binary::pe::{PeFile, Section};
+    use crate::ir::expr::BlockRef;
+
+    const IMAGE_BASE: u64 = 0x0001_4000_0000;
+    const START: u64 = IMAGE_BASE + 0x1000;
+
+    fn executable_pe(code: &[u8]) -> PeFile {
+        let mut data = vec![0u8; 0x400];
+        data[0x200..0x200 + code.len()].copy_from_slice(code);
+        PeFile {
+            data,
+            image_base: IMAGE_BASE,
+            entry_point_rva: 0x1000,
+            size_of_image: 0x2000,
+            sections: vec![Section {
+                name: ".text".into(),
+                virtual_address: 0x1000,
+                virtual_size: 0x100,
+                raw_address: 0x200,
+                raw_size: 0x100,
+                characteristics: 0x2000_0000,
+            }],
+            opt_header_offset: 0,
+            section_table_offset: 0,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+            size_of_headers: 0x200,
+            loader_bound: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn emulator_compaction_remaps_state_events_pins_and_external_roots() {
+        let pe = executable_pe(&[0xc3]);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        for _ in 0..32 {
+            emu.arena.opaque("dead-history", Width::W64);
+        }
+        let state_root = emu.arena.opaque("state-root", Width::W64);
+        let event_addr = emu.arena.opaque("event-addr", Width::W64);
+        let event_value = emu.arena.opaque("event-value", Width::W64);
+        let pin = emu.arena.opaque("pin-root", Width::W8);
+        let mut retained = [emu.arena.param(BlockRef(9), Reg::R12)];
+        emu.state.set_reg(Reg::Rax, state_root);
+        emu.events.push(Event::Store {
+            addr: event_addr,
+            value: event_value,
+            width: Width::W64,
+            site: START,
+            region: Region::Guest,
+        });
+        emu.pins.push((pin, 1));
+        let hashes = [state_root, event_addr, event_value, pin, retained[0]]
+            .map(|r| emu.arena.structural_hash(r, 8));
+
+        emu.compact_arena(&mut retained);
+
+        let Event::Store { addr, value, .. } = &emu.events[0] else {
+            panic!("store event changed variant")
+        };
+        let remapped = [
+            emu.state.reg(Reg::Rax),
+            *addr,
+            *value,
+            emu.pins[0].0,
+            retained[0],
+        ];
+        assert_eq!(remapped.map(|r| emu.arena.structural_hash(r, 8)), hashes);
+        for root in remapped {
+            let _ = emu.arena.op(root);
+        }
+    }
+
+    #[test]
+    fn emulator_compaction_clears_ref_indexed_caches() {
+        let pe = executable_pe(&[0xc3]);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        let pin = emu.arena.opaque("pin-root", Width::W8);
+        let value = emu.state.reg(Reg::Rax);
+        emu.pins.push((pin, 1));
+        emu.subst_memo.insert(pin, value);
+        emu.pin_dep.insert(pin, true);
+        emu.memo_pin_count = 0;
+
+        emu.compact_arena(&mut []);
+
+        assert!(emu.subst_memo.is_empty());
+        assert!(emu.pin_dep.is_empty());
+        assert_eq!(emu.memo_pin_count, emu.pins.len());
+    }
+
+    #[test]
+    fn emulator_compaction_reports_before_and_after_counts() {
+        let pe = executable_pe(&[0xc3]);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        for _ in 0..20 {
+            emu.arena.opaque("dead-history", Width::W64);
+        }
+        let mut roots = emu.state.symbolic_roots();
+        roots.extend(emu.pins.iter().map(|(root, _)| *root));
+        for event in &emu.events {
+            event.append_roots(&mut roots);
+        }
+        let expected_before = emu.arena.len();
+        let expected_after = emu.arena.reachable_from(&roots);
+
+        let counts = emu.compact_arena(&mut []);
+
+        assert_eq!((counts.0, counts.1), (expected_before, expected_after));
+        assert!(counts.2 > 0);
+        assert_eq!(emu.arena.len(), expected_after);
+        assert!(expected_after < expected_before);
+    }
+
+    #[test]
+    fn run_compacts_dead_history_and_continues() {
+        let pe = executable_pe(&[0xc3]);
+        let mut compacting = Emulator::new(&pe, 0x7fff_ffff_0000);
+        for _ in 0..64 {
+            compacting.arena.opaque("dead-history", Width::W64);
+        }
+        let mut control = compacting.clone();
+        control.node_limit = usize::MAX;
+        compacting.node_limit = compacting.arena.len() - 1;
+        crate::vm::diag::begin(START);
+        crate::vm::diag::set_pass(2);
+
+        let control_stop = control.run(START, 1);
+        let compacted_stop = compacting.run(START, 1);
+        let diagnostics = crate::vm::diag::take();
+
+        assert!(matches!(control_stop, Stop::Return { .. }));
+        assert!(matches!(compacted_stop, Stop::Return { .. }));
+        assert!(compacting.arena.len() <= compacting.node_limit);
+        assert_eq!(diagnostics.compactions.len(), 1);
+        let record = &diagnostics.compactions[0];
+        assert_eq!(record.entry, START);
+        assert_eq!(record.pass, 2);
+        assert_eq!(record.site, START);
+        assert!(record.before > record.after);
+        assert!(record.after <= compacting.arena.len());
+        assert!(record.after <= compacting.node_limit);
+    }
+
+    #[test]
+    fn run_diverges_when_the_live_dag_still_exceeds_the_limit() {
+        let pe = executable_pe(&[0xc3]);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        let mut live = emu.state.reg(Reg::Rax);
+        for generation in 0..64 {
+            live = emu.arena.load_at(live, Width::W64, generation);
+        }
+        emu.state.set_reg(Reg::Rax, live);
+        emu.node_limit = 32;
+
+        let stop = emu.run(START, 1);
+
+        let Stop::Diverged { site, nodes } = stop else {
+            panic!("a genuinely oversized live DAG did not diverge")
+        };
+        assert_eq!(site, START);
+        assert_eq!(nodes, emu.arena.len());
+        assert!(nodes > emu.node_limit);
+    }
+
+    #[test]
+    fn run_diverges_before_resuming_an_unsafe_live_dag_depth() {
+        let pe = executable_pe(&[0xc3]);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        let mut live = emu.state.reg(Reg::Rax);
+        for generation in 0..MAX_SAFE_LIVE_DAG_DEPTH as u32 {
+            live = emu.arena.load_at(live, Width::W64, generation);
+        }
+        emu.state.set_reg(Reg::Rax, live);
+        let live_nodes = emu.arena.reachable_from(&emu.state.symbolic_roots());
+        for _ in 0..live_nodes {
+            emu.arena.opaque("dead-history", Width::W64);
+        }
+        emu.node_limit = live_nodes + 128;
+
+        let stop = emu.run(START, 1);
+
+        let Stop::Diverged { site, nodes } = stop else {
+            panic!("an evaluator-unsafe live DAG depth resumed execution")
+        };
+        assert_eq!(site, START);
+        assert_eq!(nodes, emu.arena.len());
+        assert!(nodes <= emu.node_limit, "node count should fit the limit");
+    }
+
+    #[test]
+    fn run_retaining_preserves_external_roots_across_compaction() {
+        let pe = executable_pe(&[0xc3]);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        let parameter = emu.arena.param(BlockRef(11), Reg::R12);
+        emu.state.set_reg(Reg::R12, parameter);
+        let replacement = emu.arena.constant(7, Width::W64);
+        emu.state.set_reg(Reg::R12, replacement);
+        for _ in 0..64 {
+            emu.arena.opaque("dead-history", Width::W64);
+        }
+        emu.node_limit = emu.arena.len() - 1;
+        let before_hash = emu.arena.structural_hash(parameter, 8);
+        let mut retained = [parameter];
+
+        let stop = emu.run_retaining(START, 1, &mut retained);
+
+        assert!(matches!(stop, Stop::Return { .. }));
+        assert_eq!(emu.arena.structural_hash(retained[0], 8), before_hash);
+        assert_eq!(
+            emu.arena.op(retained[0]),
+            &Op::Param(BlockRef(11), Reg::R12)
+        );
+    }
 }
 
 #[cfg(test)]
