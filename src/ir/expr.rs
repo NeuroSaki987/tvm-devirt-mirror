@@ -578,6 +578,12 @@ impl Arena {
             }
         }
 
+        // Every node is created after its children, so the original Ref order
+        // is already topological. Preserve that relative order to keep the
+        // canonical operand ordering of commutative nodes independent of the
+        // caller's root order.
+        order.sort_unstable();
+
         let mut nodes = Vec::with_capacity(order.len());
         let mut intern = HashMap::with_capacity(order.len());
         let mut remap = HashMap::with_capacity(order.len());
@@ -2977,6 +2983,25 @@ mod tests {
             a.op(second_new),
             &Op::Bin(BinOp::Sub, shared_new, remap[&x])
         );
+    }
+
+    #[test]
+    fn compact_recanonicalizes_commutative_operands_after_ref_remapping() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rax);
+        let y = a.init_reg(Reg::Rbx);
+        let sum = a.bin(BinOp::Add, x, y);
+
+        // Retaining `y` first deliberately reverses the two leaf indices in
+        // the compacted arena. The existing sum must follow the new canonical
+        // Ref order or a later construction of the same expression will no
+        // longer hash-cons to it.
+        let remap = a.compact(&[y, sum]);
+        let rebuilt = a.bin(BinOp::Add, remap[&x], remap[&y]);
+
+        assert_eq!(rebuilt, remap[&sum]);
+        let difference = a.bin(BinOp::Sub, remap[&sum], rebuilt);
+        assert_eq!(a.as_const(difference), Some(0));
     }
 
     #[test]
