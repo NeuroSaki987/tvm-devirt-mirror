@@ -2992,9 +2992,10 @@ mod tests {
         let y = a.init_reg(Reg::Rbx);
         let sum = a.bin(BinOp::Add, x, y);
 
-        // Retaining `y` first changes the DFS visitation order. Compaction
-        // must still preserve the leaves' original relative Ref order or a
-        // later construction of the same expression will not hash-cons to it.
+        // Retaining `y` first changes the DFS visitation order without changing
+        // the old Ref order. Compaction must preserve that relative ordering or
+        // a later construction of the same expression will not hash-cons to
+        // the retained sum.
         let remap = a.compact(&[y, sum]);
         let rebuilt = a.bin(BinOp::Add, remap[&x], remap[&y]);
 
