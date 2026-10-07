@@ -83,6 +83,17 @@ pub fn cmd_write_devirt(
     // Recovery-level accounting over every function, so budget truncation is
     // never mistaken for a recovery failure in a sweep report.
     println!("  {}", report.unresolved.render_with_budget());
+    let families = report.unresolved.render_families();
+    if !families.is_empty() {
+        println!("  {families}");
+    }
+    if report.unresolved.families.work_budget > 0 {
+        println!(
+            "    NOTE: {} block(s) stopped by the step/time budget are counted in \
+             `genuine` above but are not recovery failures",
+            report.unresolved.families.work_budget
+        );
+    }
     if report.unresolved.truncated != report.unresolved.predicted_truncated {
         println!(
             "    NOTE: {} blocks carry the budget reason but the arithmetic predicts {}; \
@@ -136,6 +147,21 @@ pub fn cmd_devirt(
     // A block dropped by the budget never ran, so counting it as a failure makes
     // a large function look unresolvable when it is merely under-budgeted.
     println!("{}", stats.render_with_budget());
+    // `genuine` is `total - truncated`, so it still folds in blocks stopped by the
+    // step or wall-clock budget. Name the families so that cannot be read as a
+    // recovery failure, and say so outright when it happens.
+    let families = stats.render_families();
+    if !families.is_empty() {
+        println!("{families}");
+    }
+    if stats.families.work_budget > 0 {
+        println!(
+            "  NOTE: {} block(s) stopped by the step/time budget are counted in \
+             `genuine` above but are not recovery failures; re-run with a larger \
+             --steps to remove them",
+            stats.families.work_budget
+        );
+    }
     // Raising the budget enlarges the graph, and a larger graph is where the SSA
     // scoping rule is most likely to break. Report it here rather than only in
     // write-devirt, so a single-function sweep can see it.
