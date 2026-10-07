@@ -111,6 +111,88 @@ pub const DEFAULT_BLOCK_BUDGET: usize = 512;
 /// it must stay byte-identical to what `recover_pass_with` writes.
 pub const BLOCK_BUDGET_REASON: &str = "block budget reached";
 
+/// The `Terminator::Unresolved` reason written when the whole-recovery wall clock
+/// or instruction budget ran out. Not a recovery failure either.
+pub const TIME_BUDGET_REASON: &str = "time budget reached";
+
+/// Reason histogram for a graph's unresolved blocks.
+///
+/// `block_budget` and `work_budget` are both artifacts: raising the matching
+/// budget is all it takes to make them disappear, so counting them against
+/// recovery quality is wrong. Every other family is a limit of the recovery
+/// rules — no budget will move it — which is why the two are worth separating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UnresolvedFamilies {
+    /// `BLOCK_BUDGET_REASON`: the continuation never ran at all.
+    pub block_budget: usize,
+    /// `budget exhausted at ...` or `TIME_BUDGET_REASON`: it ran, and a budget
+    /// other than the block budget stopped it.
+    pub work_budget: usize,
+    /// `folding diverged at ...`: the expression DAG hit the node limit.
+    pub diverged: usize,
+    /// `argument-dependent indirect branch at ...`: abandoned on purpose.
+    pub argument_dependent: usize,
+    /// `unresolved branch at ...`: candidates were tried, none folded to code.
+    pub unresolved_branch: usize,
+    /// `unsupported at ...`: the lifter has no rule for the instruction.
+    pub unsupported: usize,
+    /// `unreadable at ...`.
+    pub unreadable: usize,
+    /// `left image at ...`.
+    pub left_image: usize,
+    /// A reason this version does not know. Non-zero means the taxonomy is stale.
+    pub other: usize,
+}
+
+impl UnresolvedFamilies {
+    /// Bucket one reason string.
+    fn single(reason: &str) -> Self {
+        let mut f = Self::default();
+        if reason == BLOCK_BUDGET_REASON {
+            f.block_budget = 1;
+        } else if reason == TIME_BUDGET_REASON || reason.starts_with("budget exhausted at ") {
+            f.work_budget = 1;
+        } else if reason.starts_with("folding diverged at ") {
+            f.diverged = 1;
+        } else if reason.starts_with("argument-dependent indirect branch at ") {
+            f.argument_dependent = 1;
+        } else if reason.starts_with("unresolved branch at ") {
+            f.unresolved_branch = 1;
+        } else if reason.starts_with("unsupported at ") {
+            f.unsupported = 1;
+        } else if reason.starts_with("unreadable at ") {
+            f.unreadable = 1;
+        } else if reason.starts_with("left image at ") {
+            f.left_image = 1;
+        } else {
+            f.other = 1;
+        }
+        f
+    }
+
+    /// Every family that fired, largest first, as `name count` joined by commas.
+    pub fn render(&self) -> String {
+        let mut parts: Vec<(&str, usize)> = vec![
+            ("block-budget", self.block_budget),
+            ("work-budget", self.work_budget),
+            ("diverged", self.diverged),
+            ("argument-dependent", self.argument_dependent),
+            ("unresolved-branch", self.unresolved_branch),
+            ("unsupported", self.unsupported),
+            ("unreadable", self.unreadable),
+            ("left-image", self.left_image),
+            ("other", self.other),
+        ];
+        parts.retain(|(_, n)| *n > 0);
+        parts.sort_by(|a, b| b.1.cmp(&a.1));
+        parts
+            .iter()
+            .map(|(name, n)| format!("{name} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// Why a recovered graph still holds `Terminator::Unresolved` blocks, split into
 /// the two populations that mean completely different things.
 ///
@@ -132,21 +214,34 @@ pub struct UnresolvedStats {
     /// arithmetic predicts `truncated` should be. Should equal `truncated`;
     /// a mismatch means a block was dropped somewhere other than the budget.
     pub predicted_truncated: usize,
+    /// Which reasons the unresolved blocks carry. `genuine` above is
+    /// `total - truncated`, so it still contains `families.work_budget`: a block
+    /// stopped by the per-path step budget is counted there but is not a recovery
+    /// failure. This histogram is what makes that visible.
+    pub families: UnresolvedFamilies,
 }
 
 impl UnresolvedStats {
     /// Measure one recovered graph against the budget it was recovered under.
     pub fn of(cfg: &Cfg, budget: usize) -> Self {
         let mut total = 0usize;
-        let mut truncated = 0usize;
+        let mut families = UnresolvedFamilies::default();
         for b in &cfg.blocks {
             if let Terminator::Unresolved { reason } = &b.terminator {
                 total += 1;
-                if reason == BLOCK_BUDGET_REASON {
-                    truncated += 1;
-                }
+                let f = UnresolvedFamilies::single(reason);
+                families.block_budget += f.block_budget;
+                families.work_budget += f.work_budget;
+                families.diverged += f.diverged;
+                families.argument_dependent += f.argument_dependent;
+                families.unresolved_branch += f.unresolved_branch;
+                families.unsupported += f.unsupported;
+                families.unreadable += f.unreadable;
+                families.left_image += f.left_image;
+                families.other += f.other;
             }
         }
+        let truncated = families.block_budget;
         Self {
             total,
             truncated,
@@ -154,6 +249,7 @@ impl UnresolvedStats {
             blocks: cfg.blocks.len(),
             budget,
             predicted_truncated: cfg.blocks.len().saturating_sub(budget),
+            families,
         }
     }
 
@@ -164,6 +260,17 @@ impl UnresolvedStats {
         self.genuine += other.genuine;
         self.blocks += other.blocks;
         self.predicted_truncated += other.predicted_truncated;
+        let f = &other.families;
+        let acc = &mut self.families;
+        acc.block_budget += f.block_budget;
+        acc.work_budget += f.work_budget;
+        acc.diverged += f.diverged;
+        acc.argument_dependent += f.argument_dependent;
+        acc.unresolved_branch += f.unresolved_branch;
+        acc.unsupported += f.unsupported;
+        acc.unreadable += f.unreadable;
+        acc.left_image += f.left_image;
+        acc.other += f.other;
     }
 
     /// `unresolved=N (block-budget truncated=T, genuine=G)`
@@ -172,6 +279,14 @@ impl UnresolvedStats {
             "unresolved={} (block-budget truncated={}, genuine={})",
             self.total, self.truncated, self.genuine
         )
+    }
+
+    /// `unresolved reasons: name count, ...`, or empty when there are none.
+    pub fn render_families(&self) -> String {
+        if self.total == 0 {
+            return String::new();
+        }
+        format!("unresolved reasons: {}", self.families.render())
     }
 
     /// The same, with the arithmetic behind `truncated` spelled out.
@@ -318,7 +433,7 @@ impl<'a> Explorer<'a> {
                     from_vm_context: false,
                     exit_regs: Vec::new(),
                     terminator: Terminator::Unresolved {
-                        reason: "time budget reached".into(),
+                        reason: TIME_BUDGET_REASON.into(),
                     },
                     cost: 0,
                     preds: Vec::new(),

@@ -189,10 +189,12 @@ pub fn cmd_cfg(
         println!("\n{} block(s) unresolved", cfg.unresolved);
         // Split the count: a block the budget cut off never ran, and saying
         // otherwise makes a large function look unresolvable.
-        println!(
-            "{}",
-            explore::UnresolvedStats::of(&cfg, max_blocks).render_with_budget()
-        );
+        let stats = explore::UnresolvedStats::of(&cfg, max_blocks);
+        println!("{}", stats.render_with_budget());
+        let families = stats.render_families();
+        if !families.is_empty() {
+            println!("{families}");
+        }
     }
     Ok(())
 }
