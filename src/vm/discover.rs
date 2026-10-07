@@ -38,6 +38,20 @@ impl StubKind {
             StubKind::NoInt3Tail => "no-int3-tail",
         }
     }
+
+    /// True only for evidence that *proves* a location is not a function.
+    /// `Int3Padding` reads the covering .pdata body; `FastFail29h` reads the
+    /// bytes at the location; `ZeroPadAlias` needs another trampoline with a
+    /// non-empty int3 tail to already own the same VM target. `NoInt3Tail` is a
+    /// shape note only -- ACE-Tray has two `E9` entries with no int3 tail and
+    /// one of them *is* recoverable -- so it must never decide the default
+    /// census. It is available behind an explicit opt-in.
+    pub fn is_proven(self) -> bool {
+        match self {
+            StubKind::Int3Padding | StubKind::FastFail29h | StubKind::ZeroPadAlias => true,
+            StubKind::NoInt3Tail => false,
+        }
+    }
 }
 
 /// Decide whether a candidate is a stub rather than a function entry.
@@ -171,9 +185,18 @@ pub struct VmEntry {
 }
 
 impl VmEntry {
-    /// True when this location is a stub rather than a virtualized function.
+    /// True when this location is proven not to be a virtualized function.
+    ///
+    /// Shape-only flags (`NoInt3Tail`) deliberately do not count: dropping a
+    /// real todo is worse than carrying a little dead weight, and the census
+    /// exists to size real work.
     pub fn is_stub(&self) -> bool {
-        self.stub.is_some()
+        self.stub.is_some_and(StubKind::is_proven)
+    }
+
+    /// True when the location was flagged by shape alone and is still listed.
+    pub fn is_shape_only(&self) -> bool {
+        matches!(self.stub, Some(StubKind::NoInt3Tail))
     }
 }
 
@@ -333,11 +356,21 @@ mod tests {
             Some(StubKind::ZeroPadAlias)
         );
         // Sole claimant of its target, but still without a TVM trampoline's
-        // shape (E9 rel32 + int3 fill).
+        // shape (E9 rel32 + int3 fill). Flagged, but only by shape.
         assert_eq!(
             classify_stub(&JMP, false, 0, false),
             Some(StubKind::NoInt3Tail)
         );
+    }
+
+    #[test]
+    fn only_byte_level_evidence_is_proven() {
+        assert!(StubKind::Int3Padding.is_proven());
+        assert!(StubKind::FastFail29h.is_proven());
+        assert!(StubKind::ZeroPadAlias.is_proven());
+        // ACE-Tray's recoverable entry carries this flag, so it must not be
+        // allowed to decide the default census.
+        assert!(!StubKind::NoInt3Tail.is_proven());
     }
 
     #[test]
