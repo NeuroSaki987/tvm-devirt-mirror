@@ -93,8 +93,9 @@ enum Cmd {
         /// Per-path instruction budget.
         #[arg(long, default_value_t = 400_000)]
         steps: usize,
-        /// Maximum blocks to recover.
-        #[arg(long, default_value_t = 512)]
+        /// Maximum blocks to recover. Raising it recovers more of a large
+        /// function; blocks past the budget are reported as truncated, not failed.
+        #[arg(long, default_value_t = vm::explore::DEFAULT_BLOCK_BUDGET)]
         max_blocks: usize,
         /// Print each recovered block's guest events.
         #[arg(long)]
@@ -175,6 +176,10 @@ enum Cmd {
         /// Functions to recover concurrently. Defaults to `min(cores, 8)`.
         #[arg(long)]
         jobs: Option<usize>,
+        /// Maximum blocks to recover per function. Blocks past the budget are
+        /// reported as truncated rather than as recovery failures.
+        #[arg(long, default_value_t = vm::explore::DEFAULT_BLOCK_BUDGET)]
+        max_blocks: usize,
     },
     /// Devirtualize one function into x86 machine code.
     Devirt {
@@ -193,6 +198,10 @@ enum Cmd {
         max_blocks: usize,
         #[arg(long, default_value_t = 120)]
         timeout: u64,
+        /// Maximum blocks to recover. Blocks past the budget are reported as
+        /// truncated rather than as recovery failures.
+        #[arg(long, default_value_t = vm::explore::DEFAULT_BLOCK_BUDGET)]
+        max_blocks: usize,
         /// Disassemble the emitted bytes after encoding.
         #[arg(long)]
         dis: bool,
@@ -314,7 +323,16 @@ fn main() -> Result<()> {
             timeout,
             vm_section,
             jobs,
-        } => cmd_write_devirt(&input, &output, steps, timeout, &vm_section, jobs),
+            max_blocks,
+        } => cmd_write_devirt(
+            &input,
+            &output,
+            steps,
+            timeout,
+            &vm_section,
+            jobs,
+            max_blocks,
+        ),
         Cmd::Devirt {
             input,
             va,
@@ -323,6 +341,7 @@ fn main() -> Result<()> {
             steps,
             max_blocks,
             timeout,
+            max_blocks,
             dis,
         } => cmd_devirt(
             &input,
@@ -332,6 +351,7 @@ fn main() -> Result<()> {
             steps,
             max_blocks,
             timeout,
+            max_blocks,
             dis,
         ),
         Cmd::Lower {

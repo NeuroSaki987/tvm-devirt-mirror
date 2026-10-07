@@ -1,4 +1,6 @@
 /target
+/build.log
+/test.log
 
 # Test binaries
 *.sys
