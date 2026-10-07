@@ -330,10 +330,28 @@ imports: {} across {} modules",
     Ok(())
 }
 
-pub fn cmd_entries(path: &PathBuf, vm_section: &str, all: bool) -> Result<()> {
+pub fn cmd_entries(
+    path: &PathBuf,
+    vm_section: &str,
+    all: bool,
+    include_stubs: bool,
+) -> Result<()> {
     let pe = pe::PeFile::load(path)?;
-    let entries = discover::find_vm_entries(&pe, vm_section);
-    println!("discovered {} virtualized functions", entries.len());
+    let discovered = discover::find_vm_entries(&pe, vm_section);
+    let stubs = discovered.iter().filter(|e| e.is_stub()).count();
+    // The census counts functions, not trampoline-shaped locations: int3
+    // padding records and __fastfail stubs inflate the denominator without
+    // ever being recoverable. --include-stubs restores the old behaviour.
+    let entries: Vec<&discover::VmEntry> = discovered
+        .iter()
+        .filter(|e| include_stubs || !e.is_stub())
+        .collect();
+    let filtered = if include_stubs { 0 } else { stubs };
+    println!(
+        "discovered {} virtualized functions ({} stubs filtered)",
+        entries.len(),
+        filtered
+    );
     let show = if all {
         entries.len()
     } else {
@@ -344,9 +362,13 @@ pub fn cmd_entries(path: &PathBuf, vm_section: &str, all: bool) -> Result<()> {
             .section_for_va(e.trampoline_va)
             .map(|s| s.name.clone())
             .unwrap_or_default();
+        let tag = match e.stub {
+            Some(k) => format!("  [stub: {}]", k.label()),
+            None => String::new(),
+        };
         println!(
-            "  {:#x} [{}] -> {:#x}  (int3 pad {})",
-            e.trampoline_va, sec, e.vm_entry_va, e.int3_padding
+            "  {:#x} [{}] -> {:#x}  (int3 pad {}){}",
+            e.trampoline_va, sec, e.vm_entry_va, e.int3_padding, tag
         );
     }
     if show < entries.len() {
