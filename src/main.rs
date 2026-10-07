@@ -42,6 +42,11 @@ enum Cmd {
         /// counted every trampoline-shaped location.
         #[arg(long)]
         include_stubs: bool,
+        /// Also drop locations flagged by shape alone (an E9 into the VM
+        /// section with no int3 tail). Off by default: that is a shape
+        /// judgement, not proof, and ACE-Tray's recoverable entry has it.
+        #[arg(long)]
+        aggressive_shape_filter: bool,
     },
     /// Linear disassembly at a virtual address
     Dis {
@@ -207,7 +212,14 @@ fn main() -> Result<()> {
             vm_section,
             all,
             include_stubs,
-        } => cmd_entries(&input, &vm_section, all, include_stubs),
+            aggressive_shape_filter,
+        } => cmd_entries(
+            &input,
+            &vm_section,
+            all,
+            include_stubs,
+            aggressive_shape_filter,
+        ),
         Cmd::Dis { input, va, count } => cmd_dis(&input, va, count),
         Cmd::Trace {
             input,

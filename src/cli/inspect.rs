@@ -335,22 +335,34 @@ pub fn cmd_entries(
     vm_section: &str,
     all: bool,
     include_stubs: bool,
+    aggressive_shape_filter: bool,
 ) -> Result<()> {
     let pe = pe::PeFile::load(path)?;
     let discovered = discover::find_vm_entries(&pe, vm_section);
+    // Only proven stubs are excluded by default: int3 padding records (their
+    // .pdata body is all CC) and second names for a target a padded trampoline
+    // already claims. Shape-only flags stay in the census and are annotated,
+    // because dropping a real todo is worse than carrying dead weight.
     let stubs = discovered.iter().filter(|e| e.is_stub()).count();
-    // The census counts functions, not trampoline-shaped locations: int3
-    // padding records and __fastfail stubs inflate the denominator without
-    // ever being recoverable. --include-stubs restores the old behaviour.
+    let shapes = discovered.iter().filter(|e| e.is_shape_only()).count();
     let entries: Vec<&discover::VmEntry> = discovered
         .iter()
-        .filter(|e| include_stubs || !e.is_stub())
+        .filter(|e| {
+            include_stubs
+                || (!e.is_stub() && !(aggressive_shape_filter && e.is_shape_only()))
+        })
         .collect();
     let filtered = if include_stubs { 0 } else { stubs };
+    let shape_filtered = if include_stubs || !aggressive_shape_filter {
+        0
+    } else {
+        shapes
+    };
     println!(
-        "discovered {} virtualized functions ({} stubs filtered)",
+        "discovered {} virtualized functions ({} stubs filtered, {} shape filtered)",
         entries.len(),
-        filtered
+        filtered,
+        shape_filtered
     );
     let show = if all {
         entries.len()
@@ -363,6 +375,7 @@ pub fn cmd_entries(
             .map(|s| s.name.clone())
             .unwrap_or_default();
         let tag = match e.stub {
+            Some(discover::StubKind::NoInt3Tail) => "  [shape: no-int3-tail]".to_string(),
             Some(k) => format!("  [stub: {}]", k.label()),
             None => String::new(),
         };
