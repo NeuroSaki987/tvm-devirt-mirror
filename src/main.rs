@@ -38,6 +38,10 @@ enum Cmd {
         /// Print all entries instead of a summary.
         #[arg(long)]
         all: bool,
+        /// Also list int3 / __fastfail stubs. Restores the old census, which
+        /// counted every trampoline-shaped location.
+        #[arg(long)]
+        include_stubs: bool,
     },
     /// Linear disassembly at a virtual address
     Dis {
@@ -202,7 +206,8 @@ fn main() -> Result<()> {
             input,
             vm_section,
             all,
-        } => cmd_entries(&input, &vm_section, all),
+            include_stubs,
+        } => cmd_entries(&input, &vm_section, all, include_stubs),
         Cmd::Dis { input, va, count } => cmd_dis(&input, va, count),
         Cmd::Trace {
             input,
