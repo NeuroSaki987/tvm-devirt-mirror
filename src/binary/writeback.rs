@@ -21,6 +21,8 @@ pub struct DevirtReport {
     pub incomplete: Vec<(u64, String)>,
     /// Recovery finished but codegen refused, with the reason.
     pub failed: Vec<(u64, String)>,
+    /// Recovery-level unresolved accounting, summed over every function.
+    pub unresolved: explore::UnresolvedStats,
     /// Image was signed and the signature has been removed.
     pub dropped_signature: bool,
     pub pdata_entries: usize,
@@ -110,6 +112,7 @@ pub fn write_devirt(
     timeout_secs: u64,
     vm_section: &str,
     jobs: usize,
+    max_blocks: usize,
 ) -> Result<(Vec<u8>, DevirtReport)> {
     // recover, schedule, and allocate all functions.
 
@@ -125,7 +128,7 @@ pub fn write_devirt(
             .par_iter()
             .map(|e| {
                 let started = std::time::Instant::now();
-                let prepared = prepare_one(pe, e, steps, timeout_secs, vm_section);
+                let prepared = prepare_one(pe, e, steps, timeout_secs, vm_section, max_blocks);
                 let elapsed = started.elapsed();
                 let n = recovered.fetch_add(1, Ordering::Relaxed) + 1;
                 let blocks = prepared.cfg.blocks.len();
@@ -191,6 +194,10 @@ pub fn write_devirt(
         retargeted: 0,
         incomplete: Vec::new(),
         failed: Vec::new(),
+        unresolved: explore::UnresolvedStats {
+            budget: max_blocks,
+            ..Default::default()
+        },
         dropped_signature: false,
         pdata_entries: 0,
         pdata_added: 0,
@@ -199,6 +206,7 @@ pub fn write_devirt(
     let mut emit_done = 0usize;
     eprintln!("emitting recovered functions…");
     for p in &prepared {
+        report.unresolved.accumulate(&p.unresolved);
         if let Some(reason) = &p.incomplete {
             report.incomplete.push((p.entry_va, reason.clone()));
             offsets.push(None);
@@ -413,6 +421,7 @@ struct PreparedFn {
     cfg: ir::Cfg,
     blocks: Vec<sched::SchedBlock>,
     allocs: Vec<regalloc::Alloc>,
+    unresolved: explore::UnresolvedStats,
 }
 
 fn prepare_one(
@@ -421,15 +430,18 @@ fn prepare_one(
     steps: usize,
     timeout_secs: u64,
     vm_section: &str,
+    max_blocks: usize,
 ) -> PreparedFn {
     let mut ex = explore::Explorer::with_vm_section(pe, crate::vm::DEFAULT_STACK_BASE, vm_section);
     ex.step_budget = steps;
     ex.time_budget = std::time::Duration::from_secs(timeout_secs);
+    ex.block_budget = max_blocks;
 
     let cfg = ex.recover(entry.vm_entry_va);
     let blocks = sched::schedule(&cfg);
     let entry_va = entry.trampoline_va;
-    let incomplete = why_incomplete(&cfg);
+    let unresolved = explore::UnresolvedStats::of(&cfg, max_blocks);
+    let incomplete = why_incomplete(&cfg, &unresolved);
     let allocs: Vec<regalloc::Alloc> = blocks.iter().map(regalloc::allocate).collect();
 
     PreparedFn {
@@ -438,11 +450,12 @@ fn prepare_one(
         cfg,
         blocks,
         allocs,
+        unresolved,
     }
 }
 
 /// Why a recovered graph cannot be retargeted, or `None` when it can.
-fn why_incomplete(cfg: &ir::Cfg) -> Option<String> {
+fn why_incomplete(cfg: &ir::Cfg, unresolved: &explore::UnresolvedStats) -> Option<String> {
     if cfg.blocks.is_empty() {
         return Some("no blocks recovered".to_string());
     }
@@ -450,7 +463,7 @@ fn why_incomplete(cfg: &ir::Cfg) -> Option<String> {
         return Some("recovery timed out".to_string());
     }
     if cfg.unresolved != 0 {
-        return Some(format!("{} block(s) never resolved", cfg.unresolved));
+        return Some(format!("{} block(s) never resolved", unresolved.render()));
     }
     let issues = explore::validate(cfg);
     if !issues.is_clean() {

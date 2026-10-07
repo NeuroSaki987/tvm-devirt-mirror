@@ -100,6 +100,92 @@ mod divergence_root_tests {
     }
 }
 
+/// Blocks recovered when the caller does not ask for a different budget.
+pub const DEFAULT_BLOCK_BUDGET: usize = 512;
+
+/// The `Terminator::Unresolved` reason written when a continuation is dropped
+/// because the block budget was already full.
+///
+/// This is not a recovery failure: the block was never even attempted. Summaries
+/// match on this exact string to split budget truncation from real failures, so
+/// it must stay byte-identical to what `recover_pass_with` writes.
+pub const BLOCK_BUDGET_REASON: &str = "block budget reached";
+
+/// Why a recovered graph still holds `Terminator::Unresolved` blocks, split into
+/// the two populations that mean completely different things.
+///
+/// A truncated block says nothing about whether the devirtualizer could have
+/// solved it: it was written without ever running the evaluator. Only `genuine`
+/// measures recovery quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UnresolvedStats {
+    /// Unresolved blocks in the graph.
+    pub total: usize,
+    /// Blocks written because the budget ran out, not because recovery failed.
+    pub truncated: usize,
+    /// Blocks recovery genuinely could not resolve.
+    pub genuine: usize,
+    /// Blocks in the graph, and the budget they were recovered under.
+    pub blocks: usize,
+    pub budget: usize,
+    /// `max(0, blocks - budget)`, summed per function: what the budget
+    /// arithmetic predicts `truncated` should be. Should equal `truncated`;
+    /// a mismatch means a block was dropped somewhere other than the budget.
+    pub predicted_truncated: usize,
+}
+
+impl UnresolvedStats {
+    /// Measure one recovered graph against the budget it was recovered under.
+    pub fn of(cfg: &Cfg, budget: usize) -> Self {
+        let mut total = 0usize;
+        let mut truncated = 0usize;
+        for b in &cfg.blocks {
+            if let Terminator::Unresolved { reason } = &b.terminator {
+                total += 1;
+                if reason == BLOCK_BUDGET_REASON {
+                    truncated += 1;
+                }
+            }
+        }
+        Self {
+            total,
+            truncated,
+            genuine: total - truncated,
+            blocks: cfg.blocks.len(),
+            budget,
+            predicted_truncated: cfg.blocks.len().saturating_sub(budget),
+        }
+    }
+
+    /// Add another function's accounting into this running total.
+    pub fn accumulate(&mut self, other: &Self) {
+        self.total += other.total;
+        self.truncated += other.truncated;
+        self.genuine += other.genuine;
+        self.blocks += other.blocks;
+        self.predicted_truncated += other.predicted_truncated;
+    }
+
+    /// `unresolved=N (block-budget truncated=T, genuine=G)`
+    pub fn render(&self) -> String {
+        format!(
+            "unresolved={} (block-budget truncated={}, genuine={})",
+            self.total, self.truncated, self.genuine
+        )
+    }
+
+    /// The same, with the arithmetic behind `truncated` spelled out.
+    pub fn render_with_budget(&self) -> String {
+        format!(
+            "{} [blocks={}, budget={}, max(0, blocks-budget)={}]",
+            self.render(),
+            self.blocks,
+            self.budget,
+            self.predicted_truncated
+        )
+    }
+}
+
 pub struct Explorer<'a> {
     pe: &'a PeFile,
     stack_base: u64,
@@ -126,7 +212,7 @@ impl<'a> Explorer<'a> {
             pe,
             stack_base,
             step_budget: 500_000,
-            block_budget: 512,
+            block_budget: DEFAULT_BLOCK_BUDGET,
             time_budget: std::time::Duration::from_secs(120),
             work_budget: 24_000_000,
             verbose: false,
@@ -258,7 +344,7 @@ impl<'a> Explorer<'a> {
                     from_vm_context: false,
                     exit_regs: Vec::new(),
                     terminator: Terminator::Unresolved {
-                        reason: "block budget reached".into(),
+                        reason: BLOCK_BUDGET_REASON.into(),
                     },
                     cost: 0,
                     preds: Vec::new(),

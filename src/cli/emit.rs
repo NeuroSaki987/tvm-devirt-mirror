@@ -2,7 +2,7 @@
 
 use crate::cli::fmt::resolve_start;
 use crate::{
-    binary::pe, binary::writeback, codegen, ir, ir::regalloc, ir::sched, vm::discover, vm::explore,
+    binary::pe, binary::writeback, codegen, ir::regalloc, ir::sched, vm::discover, vm::explore,
 };
 use anyhow::Result;
 use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
@@ -22,15 +22,17 @@ pub fn cmd_write_devirt(
     timeout: u64,
     vm_section: &str,
     jobs: Option<usize>,
+    max_blocks: usize,
 ) -> Result<()> {
     let pe = pe::PeFile::load(input)?;
     let entries = discover::find_vm_entries(&pe, vm_section);
     let jobs = jobs.unwrap_or_else(default_jobs).max(1);
     eprintln!(
-        "devirtualizing {} functions… ({jobs} at a time)",
+        "devirtualizing {} functions… ({jobs} at a time, block budget {max_blocks})",
         entries.len()
     );
-    let (out, report) = writeback::write_devirt(&pe, &entries, steps, timeout, vm_section, jobs)?;
+    let (out, report) =
+        writeback::write_devirt(&pe, &entries, steps, timeout, vm_section, jobs, max_blocks)?;
     std::fs::write(output, &out)?;
     println!("wrote {} bytes to {:?}", out.len(), output);
 
@@ -78,6 +80,16 @@ pub fn cmd_write_devirt(
         "  checksum: {:#010x} sig: {}",
         report.checksum, report.dropped_signature
     );
+    // Recovery-level accounting over every function, so budget truncation is
+    // never mistaken for a recovery failure in a sweep report.
+    println!("  {}", report.unresolved.render_with_budget());
+    if report.unresolved.truncated != report.unresolved.predicted_truncated {
+        println!(
+            "    NOTE: {} blocks carry the budget reason but the arithmetic predicts {}; \
+             the budget is not the only source of dropped blocks",
+            report.unresolved.truncated, report.unresolved.predicted_truncated
+        );
+    }
     Ok(())
 }
 
@@ -100,6 +112,7 @@ pub fn cmd_devirt(
     stack_base: u64,
     steps: usize,
     timeout: u64,
+    max_blocks: usize,
     dis: bool,
 ) -> Result<()> {
     let pe = pe::PeFile::load(path)?;
@@ -107,19 +120,26 @@ pub fn cmd_devirt(
     let mut ex = explore::Explorer::new(&pe, stack_base);
     ex.step_budget = steps;
     ex.time_budget = std::time::Duration::from_secs(timeout);
+    ex.block_budget = max_blocks;
     let cfg = ex.recover(start);
 
-    let unresolved = cfg
-        .blocks
-        .iter()
-        .filter(|b| matches!(&b.terminator, ir::Terminator::Unresolved { .. }))
-        .count();
+    let stats = explore::UnresolvedStats::of(&cfg, max_blocks);
     println!(
         "recovered {} blocks ({} unresolved) in {:.0?}",
         cfg.blocks.len(),
-        unresolved,
+        stats.total,
         cfg.total_steps,
     );
+    // A block dropped by the budget never ran, so counting it as a failure makes
+    // a large function look unresolvable when it is merely under-budgeted.
+    println!("{}", stats.render_with_budget());
+    // Raising the budget enlarges the graph, and a larger graph is where the SSA
+    // scoping rule is most likely to break. Report it here rather than only in
+    // write-devirt, so a single-function sweep can see it.
+    let issues = explore::validate(&cfg);
+    if !issues.is_clean() {
+        println!("cfg issues: {}", issues.summary());
+    }
 
     let sched_blocks = sched::schedule(&cfg);
     let allocs: Vec<regalloc::Alloc> = sched_blocks.iter().map(regalloc::allocate).collect();
