@@ -5,6 +5,15 @@
 
 反虚拟化、CFG 恢复、IR 和代码生成等基础功能来自原项目。这个仓库当前重点维护新增的 `unresolved` 命令，用来分析函数为什么没有完整恢复，并为后续恢复算法优化提供可复现数据。
 
+## 独立功能分支
+
+下面两项改进分别维护在独立分支中，**尚未合入 `master`**，可以按需要单独检出：
+
+- [`feat/configurable-block-budget`](https://github.com/NeuroSaki987/tvm-devirt-mirror/tree/feat/configurable-block-budget)：为 `devirt` 和 `write-devirt` 增加可配置的 `--max-blocks`，并区分块预算截断与规则级未解析、汇总未解析原因族。它主要用于大型 CFG 的预算控制和诊断；提高上限不等于提高完整恢复率。
+- [`fix/pseudo-entry-filter`](https://github.com/NeuroSaki987/tvm-devirt-mirror/tree/fix/pseudo-entry-filter)：修正 `entries` 普查口径，默认过滤有字节证据的填充和伪入口，同时保留仅凭形状可疑的入口。该分支不改变 `devirt` / `write-devirt` 使用的恢复入口集合。
+
+两个分支都基于 `1639a00`，各自包含说明、测试和独立提交，方便分别审查与使用。
+
 
 ## 相比原项目增加了什么
 
@@ -58,6 +67,11 @@ cargo test --release
 ## English
 
 This is a maintained mirror of [`jz0/tvm-devirt`](https://github.com/jz0/tvm-devirt). The base devirtualizer comes from upstream; this repository focuses on additional tooling for explaining incomplete recovery.
+
+Two additional changes are maintained as separate branches and are not merged into `master`:
+
+- [`feat/configurable-block-budget`](https://github.com/NeuroSaki987/tvm-devirt-mirror/tree/feat/configurable-block-budget) adds configurable block limits and separates budget truncation from rule-level unresolved blocks.
+- [`fix/pseudo-entry-filter`](https://github.com/NeuroSaki987/tvm-devirt-mirror/tree/fix/pseudo-entry-filter) makes the `entries` census conservatively exclude byte-proven stubs without changing recovery discovery.
 
 The added `unresolved` command reports final unresolved CFG blocks, failed indirect-branch expressions, candidate arms, bounded-index probes, CFG invariant violations, and expression-DAG composition. Diagnostic-only work is excluded from the recovery timeout, and the tool does not discard unproven paths merely to reduce the unresolved count.
 
