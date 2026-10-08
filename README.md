@@ -1,4 +1,28 @@
-# tvm-devirt
+# tvm-devirt — 保守伪入口过滤分支
+
+> 分支：`fix/pseudo-entry-filter`
+>
+> 维护镜像：[`NeuroSaki987/tvm-devirt-mirror`](https://github.com/NeuroSaki987/tvm-devirt-mirror)
+>
+> 原项目：[`jz0/tvm-devirt`](https://github.com/jz0/tvm-devirt)
+
+这个独立分支修正 `entries` 的入口统计：默认排除有字节证据的 `int3` 填充、`__fastfail` 桩和重复填充别名，但保留仅凭形状可疑的 `no-int3-tail` 入口，避免误删真实函数。恢复使用的入口发现集合不变，因此不会改变 `devirt` 或 `write-devirt` 的恢复范围。
+
+```bash
+tvm-devirt entries input.exe --all
+tvm-devirt entries input.exe --all --include-stubs
+tvm-devirt entries input.exe --all --aggressive-shape-filter
+```
+
+在 ACE 普查语料上，旧口径为 5,920 个入口；保守默认口径为 4,270 个。激进形状过滤会再排除 61 个入口，得到 4,209 个，但可能过滤真实入口，因此不作为默认值。
+
+## English
+
+This branch makes the `entries` census exclude byte-proven padding and stub records by default while retaining shape-only `no-int3-tail` entries. `--include-stubs` restores the legacy census and `--aggressive-shape-filter` opts into the riskier shape filter. Recovery discovery remains unchanged.
+
+---
+
+# Upstream README
 
 A static devirtualizer targeting Tencent VM (TVM). Recovers virtualized control flow & attempts to lower guest behavior back to native x86.
 
