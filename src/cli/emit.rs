@@ -125,7 +125,6 @@ pub fn cmd_devirt(
     steps: usize,
     max_blocks: usize,
     timeout: u64,
-    max_blocks: usize,
     dis: bool,
 ) -> Result<()> {
     let pe = pe::PeFile::load(path)?;
@@ -134,7 +133,6 @@ pub fn cmd_devirt(
     ex.step_budget = steps;
     ex.block_budget = max_blocks;
     ex.time_budget = std::time::Duration::from_secs(timeout);
-    ex.block_budget = max_blocks;
     let cfg = ex.recover(start);
 
     let stats = explore::UnresolvedStats::of(&cfg, max_blocks);

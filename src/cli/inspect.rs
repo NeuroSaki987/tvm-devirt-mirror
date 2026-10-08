@@ -348,8 +348,7 @@ pub fn cmd_entries(
     let entries: Vec<&discover::VmEntry> = discovered
         .iter()
         .filter(|e| {
-            include_stubs
-                || (!e.is_stub() && !(aggressive_shape_filter && e.is_shape_only()))
+            include_stubs || (!e.is_stub() && !(aggressive_shape_filter && e.is_shape_only()))
         })
         .collect();
     let filtered = if include_stubs { 0 } else { stubs };

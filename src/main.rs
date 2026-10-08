@@ -198,10 +198,6 @@ enum Cmd {
         max_blocks: usize,
         #[arg(long, default_value_t = 120)]
         timeout: u64,
-        /// Maximum blocks to recover. Blocks past the budget are reported as
-        /// truncated rather than as recovery failures.
-        #[arg(long, default_value_t = vm::explore::DEFAULT_BLOCK_BUDGET)]
-        max_blocks: usize,
         /// Disassemble the emitted bytes after encoding.
         #[arg(long)]
         dis: bool,
@@ -341,7 +337,6 @@ fn main() -> Result<()> {
             steps,
             max_blocks,
             timeout,
-            max_blocks,
             dis,
         } => cmd_devirt(
             &input,
@@ -351,7 +346,6 @@ fn main() -> Result<()> {
             steps,
             max_blocks,
             timeout,
-            max_blocks,
             dis,
         ),
         Cmd::Lower {
