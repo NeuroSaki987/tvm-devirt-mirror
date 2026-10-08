@@ -1,4 +1,27 @@
-# tvm-devirt
+# tvm-devirt — 可配置块预算分支
+
+> 分支：`feat/configurable-block-budget`
+>
+> 维护镜像：[`NeuroSaki987/tvm-devirt-mirror`](https://github.com/NeuroSaki987/tvm-devirt-mirror)
+>
+> 原项目：[`jz0/tvm-devirt`](https://github.com/jz0/tvm-devirt)
+
+这个独立分支为 `devirt` 和 `write-devirt` 增加 `--max-blocks <N>`，默认值仍为 512；同时把块上限造成的截断与规则级未解析分开统计，并输出未解析原因族。默认参数下保持原有行为。
+
+```bash
+tvm-devirt devirt input.exe 0x140001000 --max-blocks 4096 --output function.bin
+tvm-devirt write-devirt input.exe output.exe --max-blocks 4096
+```
+
+该功能用于区分“预算截断”和“真实恢复失败”，方便分析大型 CFG。提高块预算并不保证函数可写回：ACE 样本测试中，25 个撞顶函数的 1,609 个截断块可以全部展开，但规则级未解析没有减少，因此本分支定位为**预算控制和诊断能力**。
+
+## English
+
+This branch adds configurable `--max-blocks` support to `devirt` and `write-devirt`, separates block-budget truncation from genuine unresolved blocks, and reports unresolved reason families. The default remains 512 and preserves existing behavior. Raising the limit expands a truncated CFG but does not guarantee successful lowering.
+
+---
+
+# Upstream README
 
 A static devirtualizer targeting Tencent VM (TVM). Recovers virtualized control flow & attempts to lower guest behavior back to native x86.
 
