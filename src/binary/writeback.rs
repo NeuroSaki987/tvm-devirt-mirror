@@ -479,3 +479,138 @@ fn align_up_u32(v: u32, align: u32) -> u32 {
 fn write_u32_at(buf: &mut Vec<u8>, off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::expr::{Arena, BlockRef, Reg};
+
+    /// A graph with `real` ordinary blocks and `truncated` blocks carrying the
+    /// block-budget reason, which is what raising the cap past `real` produces.
+    fn graph(real: usize, truncated: usize) -> ir::Cfg {
+        let mut arena = Arena::default();
+        let entry = ir::BlockId {
+            handler: 0x1000,
+            vip: None,
+        };
+        let mut blocks = Vec::new();
+        for i in 0..real {
+            blocks.push(ir::Block {
+                id: ir::BlockId {
+                    handler: 0x1000 + i as u64 * 0x10,
+                    vip: None,
+                },
+                block_ref: BlockRef(i as u32),
+                params: Vec::new(),
+                events: Vec::new(),
+                from_vm_context: false,
+                exit_regs: vec![(Reg::Rax, arena.init_reg(Reg::Rax))],
+                terminator: if i + 1 == real {
+                    ir::Terminator::TailCall { target: 0x2000 }
+                } else {
+                    ir::Terminator::Jump(ir::BlockId {
+                        handler: 0x1000 + (i as u64 + 1) * 0x10,
+                        vip: None,
+                    })
+                },
+                cost: 1,
+                preds: if i == 0 { Vec::new() } else { Vec::new() },
+            });
+        }
+        for t in 0..truncated {
+            blocks.push(ir::Block {
+                id: ir::BlockId {
+                    handler: 0x9000 + t as u64 * 0x10,
+                    vip: None,
+                },
+                block_ref: BlockRef((real + t) as u32),
+                params: Vec::new(),
+                events: Vec::new(),
+                from_vm_context: false,
+                exit_regs: Vec::new(),
+                terminator: ir::Terminator::Unresolved {
+                    reason: explore::BLOCK_BUDGET_REASON.into(),
+                },
+                cost: 0,
+                preds: Vec::new(),
+            });
+        }
+        // `validate` walks predecessors, so thread them for the linear chain.
+        for i in 1..real {
+            let prev = blocks[i - 1].id;
+            blocks[i].preds = vec![prev];
+        }
+        ir::Cfg {
+            entry,
+            arena,
+            blocks,
+            total_steps: real,
+            unresolved: truncated,
+            back_edges: Vec::new(),
+            trivial_phis_removed: 0,
+            timed_out: false,
+            stack_base: crate::vm::DEFAULT_STACK_BASE,
+            vm_range: (0, 0),
+        }
+    }
+
+    /// Raising the cap must turn a truncated graph into a complete one, and must
+    /// never turn a recovery failure into a truncation: the two are counted apart
+    /// and reported apart, because only one of them is the caller's to fix.
+    #[test]
+    fn raising_the_block_cap_separates_truncation_from_recovery_failure() {
+        // Two real blocks recovered under a cap of one: the second is truncated.
+        let capped = graph(1, 1);
+        let stats = explore::UnresolvedStats::of(&capped, 1);
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.truncated, 1, "the dropped block carries the budget reason");
+        assert_eq!(stats.genuine, 0, "nothing about recovery failed");
+        assert_eq!(stats.families.block_budget, 1);
+        assert_eq!(stats.predicted_truncated, 1);
+        assert_eq!(stats.truncated, stats.predicted_truncated);
+        // And it must not be reported as complete.
+        let reason = why_incomplete(&capped, &stats)
+            .expect("a budget-truncated graph must never be treated as complete");
+        assert!(
+            reason.contains("block-budget truncated=1"),
+            "the reason must name truncation, got {reason:?}"
+        );
+        assert!(
+            reason.contains("genuine=0"),
+            "the reason must not blame recovery, got {reason:?}"
+        );
+
+        // The same function under a cap that fits it: nothing is truncated and it
+        // is no longer reported as incomplete.
+        let raised = graph(2, 0);
+        let stats = explore::UnresolvedStats::of(&raised, 8);
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.truncated, 0);
+        assert_eq!(stats.genuine, 0);
+        assert_eq!(stats.predicted_truncated, 0);
+        assert_eq!(why_incomplete(&raised, &stats), None);
+    }
+
+    /// A block that recovery genuinely could not resolve stays a failure at every
+    /// cap: raising the budget must never reclassify it as truncation.
+    #[test]
+    fn a_genuine_failure_is_not_reclassified_by_a_raised_cap() {
+        let mut cfg = graph(2, 0);
+        cfg.blocks[1].terminator = ir::Terminator::Unresolved {
+            reason: "unsupported at 0x1234: vmxon".into(),
+        };
+        cfg.unresolved = 1;
+
+        for cap in [1usize, 2, 512, 4096] {
+            let stats = explore::UnresolvedStats::of(&cfg, cap);
+            assert_eq!(stats.truncated, 0, "cap {cap} invented a truncation");
+            assert_eq!(stats.genuine, 1, "cap {cap} lost the genuine failure");
+            assert_eq!(stats.families.unsupported, 1);
+            let reason = why_incomplete(&cfg, &stats).expect("a failure is still incomplete");
+            assert!(
+                reason.contains("genuine=1"),
+                "cap {cap} reported the failure as {reason:?}"
+            );
+        }
+    }
+}
