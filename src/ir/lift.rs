@@ -829,6 +829,108 @@ impl<'a> Emulator<'a> {
         out
     }
 
+    /// Re-express every guest-register parameter held by the *live* state in terms
+    /// of `block`'s own parameters, so the whole entry state depends only on this
+    /// block's entry and not on the path that reached it.
+    ///
+    /// [`Self::seed_guest_params`] rewrites the guest register *image*, which is only
+    /// one of the places a guest value lives. The VM's handler chain also copies
+    /// guest values into its own scratch: interpreter registers and scratch memory.
+    /// Those copies still name the parameter of whichever block ran first along the
+    /// path that produced this fork's state. That is harmless while the owner
+    /// dominates the user -- which is what happens in an acyclic graph, where a join
+    /// dominates everything reachable from it -- but it is a genuine SSA violation
+    /// the moment the owner does not dominate, and a cyclic CFG is exactly where that
+    /// happens: the two arms of the cycle are both successors of the same header, so
+    /// neither dominates the other, and each arm's state leaks into the other.
+    ///
+    /// A foreign parameter leaf denotes the value of guest register `reg` as the VM
+    /// materialised it out of the guest image. Inside this block the only
+    /// path-independent name for that register is this block's own parameter for it,
+    /// so that is what the leaf is rewritten to. The rewrite is leaf-level and goes
+    /// through the arena's normal constructors, so a load whose address was a foreign
+    /// `rsp` becomes a load from this block's `rsp` rather than an opaque.
+    ///
+    /// With `onto_own_params` false each foreign leaf becomes a fresh unknown instead.
+    /// That is unconditionally sound but throws away the register identity, which is
+    /// usually the whole reason the value was computable.
+    ///
+    /// Returns the number of distinct parameter nodes re-expressed.
+    pub fn reanchor_foreign_params(
+        &mut self,
+        block: crate::ir::expr::BlockRef,
+        seeded: &[(Reg, Ref)],
+        onto_own_params: bool,
+    ) -> usize {
+        let own: HashMap<Reg, Ref> = seeded.iter().copied().collect();
+        let mut roots = self.state.symbolic_roots();
+        roots.extend(self.pins.iter().map(|(root, _)| *root));
+
+        let mut foreign: Vec<(Ref, Reg)> = Vec::new();
+        let mut seen: HashSet<Ref> = HashSet::new();
+        for &root in &roots {
+            for leaf in crate::ir::expr::leaves(&self.arena, root) {
+                if let Op::Param(owner, reg) = *self.arena.op(leaf) {
+                    if owner != block && seen.insert(leaf) {
+                        foreign.push((leaf, reg));
+                    }
+                }
+            }
+        }
+        if foreign.is_empty() {
+            return 0;
+        }
+
+        let mut map: HashMap<Ref, Ref> = HashMap::new();
+        for (leaf, reg) in &foreign {
+            let replacement = if onto_own_params {
+                match own.get(reg) {
+                    // A register this block did not parameterise has no honest
+                    // path-independent name here, so leave the leaf alone and let
+                    // validation report it rather than inventing a value.
+                    Some(&p) => p,
+                    None => continue,
+                }
+            } else {
+                self.arena.opaque("path-dependent", Width::W64)
+            };
+            map.insert(*leaf, replacement);
+        }
+        if map.is_empty() {
+            return 0;
+        }
+        let rewritten = map.len();
+
+        let arena = &mut self.arena;
+        let state = &mut self.state;
+        for value in state.regs.values_mut() {
+            *value = arena.rewrite(*value, &map);
+        }
+        for value in state.flags.values_mut() {
+            *value = arena.rewrite(*value, &map);
+        }
+        for byte in state.mem.values_mut() {
+            if let crate::vm::state::Byte::Sym { expr, .. } = byte {
+                *expr = arena.rewrite(*expr, &map);
+            }
+        }
+        for (addr, value, _) in &mut state.sym_stores {
+            *addr = arena.rewrite(*addr, &map);
+            *value = arena.rewrite(*value, &map);
+        }
+        for value in state.xmm.values_mut() {
+            *value = arena.rewrite(*value, &map);
+        }
+        for (root, _) in &mut self.pins {
+            *root = arena.rewrite(*root, &map);
+        }
+        // Every memo is keyed by a `Ref` that may have just been replaced.
+        self.subst_memo.clear();
+        self.pin_dep.clear();
+        self.memo_pin_count = self.pins.len();
+        rewritten
+    }
+
     /// Probe a candidate guest register image at `base`, returning (InitReg matches, whether the RSP slot is plausible, the slots). Slots that cannot be read are omitted rather than failing the whole image.
     fn probe_context_at(&mut self, base: u64) -> (usize, bool, Vec<(Reg, Ref)>) {
         let (score, rsp, regs, _) = self.probe_best_layout(base);
@@ -3930,4 +4032,135 @@ fn callee_never_returns(pe: &PeFile, entry: u64) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod reanchor_tests {
+    use super::*;
+    use crate::binary::pe::{PeFile, Section};
+    use crate::ir::expr::BlockRef;
+
+    const IMAGE_BASE: u64 = 0x0001_4000_0000;
+    const STACK_BASE: u64 = 0x7fff_ffff_0000;
+
+    fn pe() -> PeFile {
+        let mut data = vec![0u8; 0x400];
+        data[0x200] = 0xc3;
+        PeFile {
+            data,
+            image_base: IMAGE_BASE,
+            entry_point_rva: 0x1000,
+            size_of_image: 0x2000,
+            sections: vec![Section {
+                name: ".text".into(),
+                virtual_address: 0x1000,
+                virtual_size: 0x100,
+                raw_address: 0x200,
+                raw_size: 0x100,
+                characteristics: 0x2000_0000,
+            }],
+            opt_header_offset: 0,
+            section_table_offset: 0,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+            size_of_headers: 0x200,
+            loader_bound: Vec::new(),
+        }
+    }
+
+    /// Every `Op::Param` leaf reachable from the live state, with its owner.
+    fn live_param_leaves(emu: &Emulator<'_>) -> Vec<(BlockRef, Reg)> {
+        let mut out = Vec::new();
+        for root in emu.state.symbolic_roots() {
+            for leaf in crate::ir::expr::leaves(&emu.arena, root) {
+                if let Op::Param(owner, reg) = *emu.arena.op(leaf) {
+                    out.push((owner, reg));
+                }
+            }
+        }
+        out.sort_by_key(|(b, r)| (b.0, *r as u8));
+        out
+    }
+
+    /// A value the VM spilled while an earlier block ran must not stay named after
+    /// that block once this block is cut: on any other edge into this block the
+    /// earlier block never ran, so the name has no value there.
+    #[test]
+    fn a_spill_from_an_earlier_block_is_renamed_onto_this_blocks_parameters() {
+        let pe = pe();
+        let mut emu = Emulator::new(&pe, STACK_BASE);
+        let earlier = BlockRef(3);
+        let here = BlockRef(7);
+
+        // The spilled value: the VM copied guest RSP into scratch while block 3 ran.
+        let rsp = emu.arena.param(earlier, Reg::Rsp);
+        let spilled = emu.arena.load(rsp, Width::W64);
+        emu.state.store_concrete(&emu.arena, 0x1000, spilled, Width::W64);
+        // ... and left the interpreter holding another guest register.
+        let rsi = emu.arena.param(earlier, Reg::Rsi);
+        emu.state.set_reg(Reg::Rax, rsi);
+        // A register this block does not parameterise must be left alone.
+        let rdx = emu.arena.param(earlier, Reg::Rdx);
+        emu.state.set_reg(Reg::Rdx, rdx);
+
+        let seeded = vec![
+            (Reg::Rsp, emu.arena.param(here, Reg::Rsp)),
+            (Reg::Rsi, emu.arena.param(here, Reg::Rsi)),
+        ];
+
+        let rewritten = emu.reanchor_foreign_params(here, &seeded, true);
+        assert_eq!(rewritten, 2, "the rsp and rsi leaves, not the rip one");
+
+        let remaining = live_param_leaves(&emu);
+        assert!(
+            remaining.iter().all(|(owner, _)| *owner == here || *owner == earlier),
+            "unexpected owners: {remaining:?}"
+        );
+        // The two parameterised registers moved onto this block...
+        assert!(remaining.contains(&(here, Reg::Rsp)));
+        assert!(remaining.contains(&(here, Reg::Rsi)));
+        assert!(!remaining.contains(&(earlier, Reg::Rsp)));
+        assert!(!remaining.contains(&(earlier, Reg::Rsi)));
+        // ... and the one with no parameter here stayed put, so validation still
+        // reports it rather than an invented value.
+        assert!(remaining.contains(&(earlier, Reg::Rdx)));
+        // The load's *address* was rewritten too, not replaced by an unknown.
+        let now = emu.state.reg(Reg::Rax);
+        let addr = crate::ir::expr::leaves(&emu.arena, now);
+        assert!(addr.contains(&emu.arena.param(here, Reg::Rsi)));
+    }
+
+    /// Without a parameter to rename onto, the conservative answer is an unknown:
+    /// still sound, but it throws away the register identity.
+    #[test]
+    fn without_a_target_parameter_the_spill_becomes_an_unknown() {
+        let pe = pe();
+        let mut emu = Emulator::new(&pe, STACK_BASE);
+        let earlier = BlockRef(3);
+        let here = BlockRef(7);
+        let rsp = emu.arena.param(earlier, Reg::Rsp);
+        emu.state.store_concrete(&emu.arena, 0x1000, rsp, Width::W64);
+
+        let rewritten = emu.reanchor_foreign_params(here, &[], false);
+        assert_eq!(rewritten, 1);
+        assert!(
+            live_param_leaves(&emu).is_empty(),
+            "no foreign parameter may survive the conservative rewrite"
+        );
+    }
+
+    /// A block that already owns the parameter keeps the same interned node, so an
+    /// ordinary block's state is untouched.
+    #[test]
+    fn a_blocks_own_parameters_are_left_exactly_as_they_were() {
+        let pe = pe();
+        let mut emu = Emulator::new(&pe, STACK_BASE);
+        let here = BlockRef(7);
+        let own = emu.arena.param(here, Reg::Rax);
+        emu.state.set_reg(Reg::Rcx, own);
+
+        let seeded = vec![(Reg::Rax, own)];
+        assert_eq!(emu.reanchor_foreign_params(here, &seeded, true), 0);
+        assert_eq!(emu.state.reg(Reg::Rcx), own);
+    }
 }

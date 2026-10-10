@@ -508,7 +508,25 @@ impl<'a> Explorer<'a> {
             // Replace the guest register image with this block's SSA parameters before any of its instructions run, so everything the block computes is expressed in terms of its own entry state rather than reaching back to function entry through whichever single path got here.
             let block_ref = expr::BlockRef(blocks.len() as u32);
             let mut entry_params = if cut_at.contains(&task.id) {
-                task.emu.seed_guest_params(block_ref)
+                let seeded = task.emu.seed_guest_params(block_ref);
+                // Seeding rewrites the guest register image, but the VM's handler
+                // chain also copies guest values into its own scratch, which still
+                // names the parameter of whichever earlier block materialised them.
+                // Where that earlier block dominates this one the reference is legal
+                // and leaving it alone keeps the value; where it does not -- which a
+                // cycle makes possible, since two arms of a cycle are both successors
+                // of their header and neither dominates the other -- it is an SSA
+                // violation no later pass can repair.
+                let reanchored = task
+                    .emu
+                    .reanchor_foreign_params(block_ref, &seeded, true);
+                if reanchored > 0 && std::env::var_os("TVM_DEBUG_CUT").is_some() {
+                    eprintln!(
+                        "  cut {}: re-anchored {reanchored} foreign parameter(s)",
+                        task.id
+                    );
+                }
+                seeded
             } else {
                 Vec::new()
             };
