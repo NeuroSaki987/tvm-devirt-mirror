@@ -788,7 +788,16 @@ impl<'a> Emulator<'a> {
             if rsp_ok && score >= MIN_CONTEXT_SCORE && best.is_none_or(|(b, _)| score > b) {
                 best = Some((score, base));
             }
-            base += 8;
+            // The window is `[rbp - 0x40, rbp + 0x200)`, so at most 0x240/8 probes.
+            // `hi` saturates at the top of the address space, though, and an RBP near
+            // it makes `base + 8` wrap to zero -- at which point `base < hi` is still
+            // true and the scan walks the whole 2^61 steps of the address space one
+            // qword at a time while holding the only thread. Wrapping is simply the
+            // end of the window.
+            let Some(next) = base.checked_add(8) else {
+                break;
+            };
+            base = next;
         }
         if best.is_none() {
             self.ctx_miss = Some((any_rsp, best_rsp_only));
