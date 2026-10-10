@@ -814,19 +814,43 @@ impl<'a> Emulator<'a> {
     /// parameter to it re-binds the block to that path. The block's successors
     /// then inherit the assertion and compute with it, which is how a fork ends up
     /// dispatching to an address the VM never reaches.
+    /// As [`Self::seed_guest_params_recording_prior`], for a caller that does not need
+    /// the prior contents.
+    #[allow(dead_code)]
     pub fn seed_guest_params(&mut self, block: crate::ir::expr::BlockRef) -> Vec<(Reg, Ref)> {
+        self.seed_guest_params_recording_prior(block).0
+    }
+
+    /// As [`Self::seed_guest_params`], also returning what each image slot held
+    /// *before* it was overwritten.
+    ///
+    /// The prior contents are the proof [`Self::reanchor_foreign_params`] needs. A
+    /// slot still holding block `owner`'s parameter for `reg` says that guest `reg`
+    /// has not been written since `owner` ran -- the image is where every guest
+    /// register value comes from -- so a copy of that register taken while `owner`
+    /// ran is still the register's current value, and this block's own parameter for
+    /// it is the same value. Nothing about the *name* of the copy proves that, which
+    /// is why the check is against the slot's contents and not against the leaf.
+    pub fn seed_guest_params_recording_prior(
+        &mut self,
+        block: crate::ir::expr::BlockRef,
+    ) -> (Vec<(Reg, Ref)>, Vec<(Reg, Ref)>) {
         let Some(base) = self.locate_guest_context() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        let mut out = Vec::new();
+        let mut seeded = Vec::new();
+        let mut prior = Vec::new();
         let layout = self.guest_layout.unwrap_or(LAYOUTS[0]);
         for (i, reg) in layout.order.iter().enumerate() {
             let addr = base.wrapping_add(layout.first_reg + i as u64 * 8);
+            if let Some(before) = self.read_slot(addr) {
+                prior.push((*reg, before));
+            }
             let p = self.arena.param(block, *reg);
             self.state.store_concrete(&self.arena, addr, p, Width::W64);
-            out.push((*reg, p));
+            seeded.push((*reg, p));
         }
-        out
+        (seeded, prior)
     }
 
     /// Re-express every guest-register parameter held by the *live* state in terms
@@ -847,32 +871,48 @@ impl<'a> Emulator<'a> {
     /// A foreign parameter leaf denotes the value of guest register `reg` as the VM
     /// materialised it out of the guest image. Inside this block the only
     /// path-independent name for that register is this block's own parameter for it,
-    /// so that is what the leaf is rewritten to. The rewrite is leaf-level and goes
-    /// through the arena's normal constructors, so a load whose address was a foreign
-    /// `rsp` becomes a load from this block's `rsp` rather than an opaque.
+    /// but that substitution is only sound when the copy is still *current*: a copy
+    /// taken before the register was overwritten is a stale snapshot, and renaming it
+    /// would make the graph validate while changing what it means, which is worse
+    /// than leaving it flagged.
+    ///
+    /// So the substitution is gated on proof, not on the leaf's name.
+    /// `prior_image` is what each guest image slot held before this block's cut
+    /// overwrote it (see [`Self::seed_guest_params_recording_prior`]). A leaf
+    /// `Param(owner, reg)` is rewritten only when the slot for `reg` still holds
+    /// exactly `Param(owner, reg)`: the image is the source of every guest register
+    /// value, so its still carrying `owner`'s parameter for `reg` proves guest `reg`
+    /// was not written between `owner` and this block, and therefore that the copy
+    /// any handler made of it during `owner` equals the value this block is
+    /// parameterised on. Everything else -- a register this block did not
+    /// parameterise, or a slot that has since been written by someone else -- is left
+    /// alone and stays visible to `validate`.
     ///
     /// With `onto_own_params` false each foreign leaf becomes a fresh unknown instead.
-    /// That is unconditionally sound but throws away the register identity, which is
-    /// usually the whole reason the value was computable.
+    /// That needs no proof -- an unknown is a superset of any value -- but throws
+    /// away the register identity, which is usually the whole reason the value was
+    /// computable.
     ///
     /// Returns the number of distinct parameter nodes re-expressed.
     pub fn reanchor_foreign_params(
         &mut self,
         block: crate::ir::expr::BlockRef,
         seeded: &[(Reg, Ref)],
+        prior_image: &[(Reg, Ref)],
         onto_own_params: bool,
     ) -> usize {
         let own: HashMap<Reg, Ref> = seeded.iter().copied().collect();
+        let prior: HashMap<Reg, Ref> = prior_image.iter().copied().collect();
         let mut roots = self.state.symbolic_roots();
         roots.extend(self.pins.iter().map(|(root, _)| *root));
 
-        let mut foreign: Vec<(Ref, Reg)> = Vec::new();
+        let mut foreign: Vec<(Ref, crate::ir::expr::BlockRef, Reg)> = Vec::new();
         let mut seen: HashSet<Ref> = HashSet::new();
         for &root in &roots {
             for leaf in crate::ir::expr::leaves(&self.arena, root) {
                 if let Op::Param(owner, reg) = *self.arena.op(leaf) {
                     if owner != block && seen.insert(leaf) {
-                        foreign.push((leaf, reg));
+                        foreign.push((leaf, owner, reg));
                     }
                 }
             }
@@ -882,15 +922,31 @@ impl<'a> Emulator<'a> {
         }
 
         let mut map: HashMap<Ref, Ref> = HashMap::new();
-        for (leaf, reg) in &foreign {
+        for (leaf, owner, reg) in &foreign {
             let replacement = if onto_own_params {
-                match own.get(reg) {
-                    // A register this block did not parameterise has no honest
-                    // path-independent name here, so leave the leaf alone and let
-                    // validation report it rather than inventing a value.
-                    Some(&p) => p,
-                    None => continue,
+                // A register this block did not parameterise has no honest
+                // path-independent name here, so leave the leaf alone and let
+                // validation report it rather than inventing a value.
+                let Some(&p) = own.get(reg) else { continue };
+                // The proof: the image slot for `reg` still holds this very block's
+                // parameter for `reg`, so nothing has written the register since.
+                let current = prior.get(reg).is_some_and(|slot| {
+                    matches!(*self.arena.op(*slot), Op::Param(o, r) if o == *owner && r == *reg)
+                });
+                if !current {
+                    if std::env::var_os("TVM_DEBUG_REANCHOR").is_some() {
+                        let slot = prior
+                            .get(reg)
+                            .map(|s| crate::ir::expr::render(&self.arena, *s, 3))
+                            .unwrap_or_else(|| "<slot unreadable>".to_string());
+                        eprintln!(
+                            "  skip {}.{} owner={} prior_slot={}",
+                            block, reg.name(), owner, slot
+                        );
+                    }
+                    continue;
                 }
+                p
             } else {
                 self.arena.opaque("path-dependent", Width::W64)
             };
@@ -4082,11 +4138,10 @@ mod reanchor_tests {
         out
     }
 
-    /// A value the VM spilled while an earlier block ran must not stay named after
-    /// that block once this block is cut: on any other edge into this block the
-    /// earlier block never ran, so the name has no value there.
+    /// With the image still holding the same block's parameter for that register, the
+    /// copy is provably current, so the leaf moves onto this block's parameter.
     #[test]
-    fn a_spill_from_an_earlier_block_is_renamed_onto_this_blocks_parameters() {
+    fn a_live_spill_is_renamed_when_the_image_still_holds_the_same_value() {
         let pe = pe();
         let mut emu = Emulator::new(&pe, STACK_BASE);
         let earlier = BlockRef(3);
@@ -4107,27 +4162,133 @@ mod reanchor_tests {
             (Reg::Rsp, emu.arena.param(here, Reg::Rsp)),
             (Reg::Rsi, emu.arena.param(here, Reg::Rsi)),
         ];
+        // The guest image was not written since block 3 ran: its Rsp and Rsi slots
+        // still hold block 3's parameters.
+        let prior = vec![(Reg::Rsp, rsp), (Reg::Rsi, rsi), (Reg::Rdx, rdx)];
 
-        let rewritten = emu.reanchor_foreign_params(here, &seeded, true);
-        assert_eq!(rewritten, 2, "the rsp and rsi leaves, not the rip one");
+        let rewritten = emu.reanchor_foreign_params(here, &seeded, &prior, true);
+        assert_eq!(rewritten, 2, "rsp and rsi, but not the register with no parameter");
 
         let remaining = live_param_leaves(&emu);
         assert!(
             remaining.iter().all(|(owner, _)| *owner == here || *owner == earlier),
             "unexpected owners: {remaining:?}"
         );
-        // The two parameterised registers moved onto this block...
         assert!(remaining.contains(&(here, Reg::Rsp)));
         assert!(remaining.contains(&(here, Reg::Rsi)));
         assert!(!remaining.contains(&(earlier, Reg::Rsp)));
         assert!(!remaining.contains(&(earlier, Reg::Rsi)));
-        // ... and the one with no parameter here stayed put, so validation still
-        // reports it rather than an invented value.
+        // The one with no parameter here stayed put, so validation still reports it
+        // rather than an invented value.
         assert!(remaining.contains(&(earlier, Reg::Rdx)));
         // The load's *address* was rewritten too, not replaced by an unknown.
         let now = emu.state.reg(Reg::Rax);
         let addr = crate::ir::expr::leaves(&emu.arena, now);
         assert!(addr.contains(&emu.arena.param(here, Reg::Rsi)));
+    }
+
+    /// The case the name-based rewrite got wrong. Guest RSP was written after the
+    /// copy was taken, so the image slot no longer holds block 3's parameter for it:
+    /// the scratch value is a *pre-write* snapshot and is not this block's entry RSP.
+    /// It must be left alone -- even though renaming it would have made the graph
+    /// validate -- because the two values are genuinely different.
+    #[test]
+    fn a_stale_snapshot_is_not_renamed_even_though_renaming_would_validate() {
+        let pe = pe();
+        let mut emu = Emulator::new(&pe, STACK_BASE);
+        let earlier = BlockRef(3);
+        let here = BlockRef(7);
+
+        let stale = emu.arena.param(earlier, Reg::Rsp);
+        emu.state.set_reg(Reg::Rax, stale);
+
+        let entry_rsp = emu.arena.param(here, Reg::Rsp);
+        let seeded = vec![(Reg::Rsp, entry_rsp)];
+        // The slot has moved on: whatever wrote it, it is no longer block 3's
+        // parameter, so guest RSP *was* modified between block 3 and here.
+        let eight = emu.arena.constant(8, Width::W64);
+        let moved_on = emu.arena.bin(BinOp::Add, stale, eight);
+        let prior = vec![(Reg::Rsp, moved_on)];
+
+        let rewritten = emu.reanchor_foreign_params(here, &seeded, &prior, true);
+        assert_eq!(rewritten, 0, "an unproven copy must not be renamed");
+        assert_eq!(
+            emu.state.reg(Reg::Rax),
+            stale,
+            "the stale snapshot must survive untouched"
+        );
+        assert_eq!(
+            live_param_leaves(&emu),
+            vec![(earlier, Reg::Rsp)],
+            "it stays owned by the earlier block, so validate keeps flagging it"
+        );
+
+        // And the reason it matters, expressed as semantics: knowing the stale
+        // snapshot does not determine this block's entry RSP, so a name-based rename
+        // would have asserted a relation the recovery never established.
+        let mut probe = emu.clone();
+        let (a, _) = probe.probe_pin(stale, 0x1000, stale);
+        let (b, _) = probe.probe_pin(stale, 0x1000, entry_rsp);
+        assert_eq!(a, Some(0x1000), "the pinned fold must actually fold");
+        assert_eq!(
+            b, None,
+            "the entry RSP is not a function of the snapshot, so renaming would \
+             assert something unproven"
+        );
+    }
+
+    /// When the proof holds, the rewrite must not change what the expression means.
+    /// Asserted on the value the expression denotes under the binding the proof
+    /// establishes, not merely on the fact that a substitution happened.
+    #[test]
+    fn a_proved_rename_preserves_the_value_the_expression_denotes() {
+        let pe = pe();
+        let mut emu = Emulator::new(&pe, STACK_BASE);
+        let earlier = BlockRef(3);
+        let here = BlockRef(7);
+
+        // A composite use, the shape the real leaks have: an offset off a guest
+        // register that the VM had copied into scratch.
+        let rsp = emu.arena.param(earlier, Reg::Rsp);
+        let sixteen = emu.arena.constant(0x10, Width::W64);
+        let original = emu.arena.bin(BinOp::Add, rsp, sixteen);
+        emu.state.store_concrete(&emu.arena, 0x1000, original, Width::W64);
+
+        let entry_rsp = emu.arena.param(here, Reg::Rsp);
+        let seeded = vec![(Reg::Rsp, entry_rsp)];
+        let prior = vec![(Reg::Rsp, rsp)];
+
+        assert_eq!(
+            emu.reanchor_foreign_params(here, &seeded, &prior, true),
+            1,
+            "the proof holds, so the leaf is renamed"
+        );
+        let rewritten = match emu.state.mem.get(&0x1000) {
+            Some(crate::vm::state::Byte::Sym { expr, .. }) => *expr,
+            other => panic!("scratch slot lost its symbolic value: {other:?}"),
+        };
+        assert_ne!(rewritten, original, "the expression must have been rewritten");
+        assert!(
+            crate::ir::expr::leaves(&emu.arena, rewritten).contains(&entry_rsp),
+            "and it must be this block's parameter that carries the value now"
+        );
+
+        // Semantics: under the binding the proof establishes -- this block's entry RSP
+        // is the value the copy was taken from -- both expressions denote the same
+        // number. That is the claim a rename makes; a test that only counts
+        // substitutions would not check it.
+        let mut probe = emu.clone();
+        let (before, _) = probe.probe_pin(rsp, 0x1000, original);
+        let (after, _) = probe.probe_pin(entry_rsp, 0x1000, rewritten);
+        assert_eq!(before, Some(0x1010), "the pinned fold must actually fold");
+        assert_eq!(before, after, "the rewrite changed what the expression denotes");
+
+        // And the rewrite is not vacuous: on a path where the entry RSP differs, it
+        // denotes the entry value rather than the earlier block's, which is the whole
+        // point of re-anchoring at a join.
+        let (other, _) = probe.probe_pin(entry_rsp, 0x2000, rewritten);
+        assert_eq!(other, Some(0x2010));
+        assert_ne!(after, other);
     }
 
     /// Without a parameter to rename onto, the conservative answer is an unknown:
@@ -4141,7 +4302,7 @@ mod reanchor_tests {
         let rsp = emu.arena.param(earlier, Reg::Rsp);
         emu.state.store_concrete(&emu.arena, 0x1000, rsp, Width::W64);
 
-        let rewritten = emu.reanchor_foreign_params(here, &[], false);
+        let rewritten = emu.reanchor_foreign_params(here, &[], &[], false);
         assert_eq!(rewritten, 1);
         assert!(
             live_param_leaves(&emu).is_empty(),
@@ -4160,7 +4321,7 @@ mod reanchor_tests {
         emu.state.set_reg(Reg::Rcx, own);
 
         let seeded = vec![(Reg::Rax, own)];
-        assert_eq!(emu.reanchor_foreign_params(here, &seeded, true), 0);
+        assert_eq!(emu.reanchor_foreign_params(here, &seeded, &[], true), 0);
         assert_eq!(emu.state.reg(Reg::Rcx), own);
     }
 }
