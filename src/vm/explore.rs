@@ -120,6 +120,38 @@ mod divergence_root_tests {
 /// Blocks recovered when the caller does not ask for a different budget.
 pub const DEFAULT_BLOCK_BUDGET: usize = 512;
 
+/// Whether the cut re-anchor (`Emulator::reanchor_foreign_params`) is enabled.
+///
+/// **Off unless `TVM_REANCHOR` is set, and that is a correctness decision, not a
+/// default.**
+///
+/// The repair renames a foreign parameter leaf onto the using block's own parameter.
+/// That changes which SSA name the block *and every block downstream of it* inherits,
+/// and a downstream block need not be dominated by the new owner even when the old
+/// owner dominated it. On `ACE-DFS64.dll` s2 that turns graphs with no scoping
+/// violation at all into graphs with hundreds:
+///
+/// | function, `--steps 4000000 --timeout 1200` | cap | blocks | unresolved | nondominating |
+/// |---|---|---|---|---|
+/// | 0x180093320 baseline | 512 | 601 | 101 | **0** |
+/// | 0x180093320 re-anchored | 512 | 601 | 101 | **440** |
+/// | 0x180093320 baseline | 1024 | 1040 | 32 | **38** |
+/// | 0x180093320 re-anchored | 1024 | 1040 | 32 | **657** |
+///
+/// Recovery is identical in every pair; only the naming changes, and for the worse.
+/// The proof in `reanchor_foreign_params` establishes that the *value* is right, but
+/// the defect being repaired is where the *name* is in scope, and the two are not the
+/// same question. `validate` reporting an ill-formed graph is the safer failure than a
+/// graph that passes while reading a value on a path that never wrote it, so the
+/// default is to leave it flagged.
+///
+/// Set `TVM_REANCHOR=1` to enable it. It does repair real graphs --- `ACE-Base64.dll`
+/// 0x180dc39a0 goes 8 -> 0 with the proof in hand --- but it damages more than it
+/// repairs at present.
+fn reanchor_enabled() -> bool {
+    std::env::var_os("TVM_REANCHOR").is_some()
+}
+
 /// The `Terminator::Unresolved` reason written when a continuation is dropped
 /// because the block budget was already full.
 ///
@@ -508,27 +540,30 @@ impl<'a> Explorer<'a> {
             // Replace the guest register image with this block's SSA parameters before any of its instructions run, so everything the block computes is expressed in terms of its own entry state rather than reaching back to function entry through whichever single path got here.
             let block_ref = expr::BlockRef(blocks.len() as u32);
             let mut entry_params = if cut_at.contains(&task.id) {
-                let (seeded, prior_image) = task.emu.seed_guest_params_recording_prior(block_ref);
-                // Seeding rewrites the guest register image, but the VM's handler
-                // chain also copies guest values into its own scratch, which still
-                // names the parameter of whichever earlier block materialised them.
-                // Where that earlier block dominates this one the reference is legal
-                // and leaving it alone keeps the value; where it does not -- which a
-                // cycle makes possible, since two arms of a cycle are both successors
-                // of their header and neither dominates the other -- it is an SSA
-                // violation no later pass can repair. `prior_image` is what each image
-                // slot held before this overwrite; it is what turns the repair from a
-                // rename into a proof, see `reanchor_foreign_params`.
-                let reanchored =
-                    task.emu
-                        .reanchor_foreign_params(block_ref, &seeded, &prior_image, true);
-                if reanchored > 0 && std::env::var_os("TVM_DEBUG_CUT").is_some() {
-                    eprintln!(
-                        "  cut {}: re-anchored {reanchored} foreign parameter(s)",
-                        task.id
+                if reanchor_enabled() {
+                    let (seeded, prior_image) =
+                        task.emu.seed_guest_params_recording_prior(block_ref);
+                    // Seeding rewrites the guest register image, but the VM's handler
+                    // chain also copies guest values into its own scratch, which still
+                    // names the parameter of whichever earlier block materialised them.
+                    // See `reanchor_foreign_params`, and the warning on
+                    // `reanchor_enabled`: this is off unless explicitly asked for.
+                    let reanchored = task.emu.reanchor_foreign_params(
+                        block_ref,
+                        &seeded,
+                        &prior_image,
+                        true,
                     );
+                    if reanchored > 0 && std::env::var_os("TVM_DEBUG_CUT").is_some() {
+                        eprintln!(
+                            "  cut {}: re-anchored {reanchored} foreign parameter(s)",
+                            task.id
+                        );
+                    }
+                    seeded
+                } else {
+                    task.emu.seed_guest_params(block_ref)
                 }
-                seeded
             } else {
                 Vec::new()
             };

@@ -814,9 +814,9 @@ impl<'a> Emulator<'a> {
     /// parameter to it re-binds the block to that path. The block's successors
     /// then inherit the assertion and compute with it, which is how a fork ends up
     /// dispatching to an address the VM never reaches.
-    /// As [`Self::seed_guest_params_recording_prior`], for a caller that does not need
-    /// the prior contents.
-    #[allow(dead_code)]
+    ///
+    /// This is the default path; [`Self::seed_guest_params_recording_prior`] is the
+    /// same thing plus the proof material the optional re-anchor needs.
     pub fn seed_guest_params(&mut self, block: crate::ir::expr::BlockRef) -> Vec<(Reg, Ref)> {
         self.seed_guest_params_recording_prior(block).0
     }
