@@ -419,12 +419,19 @@ impl<'a> Explorer<'a> {
         let mut timed_out = false;
         let mut unresolved = 0usize;
 
+        // One clock for the whole pass, consulted both between blocks and inside
+        // them. Both checks have to measure the same thing: the between-block check
+        // explains why exploration stopped, and the in-block one only decides how far
+        // past the deadline a single block is allowed to run before it admits it.
+        let deadline = crate::ir::lift::RecoveryDeadline::starting_now(self.time_budget);
+
         let mut queue: Vec<Task> = vec![Task {
             emu: {
                 let mut e = Emulator::with_vm_section(self.pe, self.stack_base, &self.vm_section);
-                // Forks clone the evaluator, so setting this on the seed reaches every
+                // Forks clone the evaluator, so setting these on the seed reaches every
                 // block in the pass.
                 e.vip_slot = vip_slot;
+                e.deadline = Some(deadline);
                 e
             },
             resume: start,
@@ -433,17 +440,12 @@ impl<'a> Explorer<'a> {
             ancestors: Vec::new(),
         }];
 
-        let pass_started = std::time::Instant::now();
-
         while let Some(mut task) = queue.pop() {
             // The work budget is the deterministic limit and should be the one that
             // fires. If the timer wins the race the result depends on machine load,
             // so say so rather than silently emitting different code than last run.
             let out_of_work = total_steps >= self.work_budget;
-            let recovery_elapsed = pass_started
-                .elapsed()
-                .saturating_sub(crate::vm::diag::excluded_time());
-            let out_of_time = recovery_elapsed >= self.time_budget;
+            let out_of_time = deadline.expired();
             if out_of_time && !out_of_work {
                 timed_out = true;
             }
@@ -519,6 +521,11 @@ impl<'a> Explorer<'a> {
             );
             // Recorded before `stop` is consumed below.
             let returning = matches!(stop, Stop::Return { .. });
+            // A block that ran out of wall clock is the same nondeterminism the
+            // between-block check reports, so the graph has to say so too.
+            if matches!(stop, Stop::Deadline { .. }) {
+                timed_out = true;
+            }
             let cost = task.emu.steps - before;
             total_steps += cost;
 
@@ -623,6 +630,13 @@ impl<'a> Explorer<'a> {
                 },
                 Stop::Budget { site } => Terminator::Unresolved {
                     reason: format!("budget exhausted at {site:#x}"),
+                },
+                // The block was abandoned because the recovery wall clock ran out, not
+                // because a recovery rule failed. It carries the same reason string as
+                // the between-block check so that both paths land in the same reason
+                // family and the same summary line.
+                Stop::Deadline { .. } => Terminator::Unresolved {
+                    reason: TIME_BUDGET_REASON.into(),
                 },
                 Stop::OutOfImage { site } => Terminator::Unresolved {
                     reason: format!("left image at {site:#x}"),
@@ -1323,6 +1337,7 @@ fn stop_kind(stop: &Stop) -> &'static str {
         Stop::Unreadable { .. } => "Unreadable",
         Stop::Backedge { .. } => "Backedge",
         Stop::Budget { .. } => "Budget",
+        Stop::Deadline { .. } => "Deadline",
         Stop::Diverged { .. } => "Diverged",
         Stop::OutOfImage { .. } => "OutOfImage",
         Stop::BadTarget { .. } => "BadTarget",
@@ -1340,6 +1355,7 @@ fn stop_site(stop: &Stop) -> u64 {
         | Stop::Unreadable { site }
         | Stop::Backedge { site, .. }
         | Stop::Budget { site }
+        | Stop::Deadline { site }
         | Stop::Diverged { site, .. }
         | Stop::OutOfImage { site }
         | Stop::BadTarget { site, .. }
@@ -2140,6 +2156,20 @@ mod dom_tests {
         let issues = validate(&cfg);
         assert!(issues.nondominating_params.is_empty());
         assert!(issues.is_clean());
+    }
+
+    /// A block stopped inside itself by the wall clock has to land in the same
+    /// reason family as one stopped between blocks: the two are the same event and
+    /// inventing a second bucket for it would split the accounting for no gain.
+    #[test]
+    fn the_in_block_deadline_shares_the_time_budget_reason_and_family() {
+        let between = UnresolvedFamilies::single(TIME_BUDGET_REASON);
+        assert_eq!(between.work_budget, 1);
+        assert_eq!(between.other, 0);
+        // ... and it is *not* truncation: a block the clock stopped did run.
+        assert_eq!(between.block_budget, 0);
+        assert!(!TIME_BUDGET_REASON.is_empty());
+        assert_ne!(TIME_BUDGET_REASON, BLOCK_BUDGET_REASON);
     }
 
     /// The missing-position invariant applies to VM handlers, not to native blocks. `.tvm0` also holds *partially* virtualized functions: the VM stub runs the prologue and then jumps into ordinary `.text` that still addresses the VM context through RBP.
