@@ -289,6 +289,12 @@ pub enum Stop {
     },
     /// Step budget exhausted.
     Budget { site: u64 },
+    /// The recovery wall clock ran out inside this block.
+    ///
+    /// Not a variant of [`Stop::Budget`]: the step budget is a deterministic limit on
+    /// one block, while this says the run stopped at a point that depends on machine
+    /// load, so the block was abandoned part way rather than finished.
+    Deadline { site: u64 },
     /// The expression DAG grew past its limit, which means folding has broken
     /// down and further evaluation would only produce garbage.
     Diverged { site: u64, nodes: usize },
@@ -392,7 +398,62 @@ pub struct Emulator<'a> {
     /// the base, since the two are only meaningful together.
     pub guest_layout: Option<Layout>,
     pub vip_slot: Option<u64>,
+    /// Wall-clock limit for the recovery pass this evaluator belongs to, when the
+    /// caller set one. Forks inherit it, so every block is charged against the same
+    /// clock.
+    pub deadline: Option<RecoveryDeadline>,
 }
+
+/// A wall-clock limit shared by every fork of one recovery pass.
+///
+/// Recovery used to consult the clock only between blocks, so one block that keeps
+/// making progress past the deadline -- a long straight-line handler chain, or a
+/// folding path whose per-instruction cost is large -- could overshoot it for as long
+/// as its step budget allowed. Carrying the limit into the evaluator lets the
+/// instruction loop notice instead.
+#[derive(Clone, Copy, Debug)]
+pub struct RecoveryDeadline {
+    /// When the pass started.
+    pub started: std::time::Instant,
+    /// Time the pass is allowed.
+    pub budget: std::time::Duration,
+}
+
+impl RecoveryDeadline {
+    /// Start charging against `budget` from now.
+    pub fn starting_now(budget: std::time::Duration) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            budget,
+        }
+    }
+
+    /// Time charged against the budget so far.
+    ///
+    /// Diagnostic-only work is excluded, exactly as the between-block check excludes
+    /// it: a diagnostic run must observe the same recovery an ordinary run would, so
+    /// its own DAG walks and candidate probes cannot be what pushes a block past the
+    /// deadline.
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started
+            .elapsed()
+            .saturating_sub(crate::vm::diag::excluded_time())
+    }
+
+    pub fn expired(&self) -> bool {
+        self.elapsed() >= self.budget
+    }
+}
+
+/// Instructions between wall-clock checks inside the evaluator's loop.
+///
+/// The clock is read once per this many instructions rather than every instruction:
+/// `Instant::now` is not free, and a block that is slow because each instruction is
+/// expensive (which is what makes a single block overshoot at all) reaches a check
+/// after a correspondingly long step anyway. 4096 keeps the cost under a tenth of a
+/// percent of an ordinary instruction and bounds the overshoot to a few thousand
+/// steps' worth of work.
+const DEADLINE_CHECK_INTERVAL: usize = 4096;
 
 /// Recursive expression analyses still used by instruction folding must remain
 /// comfortably inside the 1 MiB Windows main-thread stack after compaction.
@@ -449,6 +510,9 @@ impl<'a> Emulator<'a> {
             // a wrong constant would degenerate `(handler, vip)` to `handler` and
             // close back edges that do not exist.
             vip_slot: None,
+            // No wall-clock limit until a recovery pass asks for one, so the
+            // inspection commands keep behaving exactly as before.
+            deadline: None,
             noreturn_slots: noreturn_import_slots(pe),
             import_slots: pe.imports().into_iter().map(|(slot, _, _)| slot).collect(),
         }
@@ -724,7 +788,16 @@ impl<'a> Emulator<'a> {
             if rsp_ok && score >= MIN_CONTEXT_SCORE && best.is_none_or(|(b, _)| score > b) {
                 best = Some((score, base));
             }
-            base += 8;
+            // The window is `[rbp - 0x40, rbp + 0x200)`, so at most 0x240/8 probes.
+            // `hi` saturates at the top of the address space, though, and an RBP near
+            // it makes `base + 8` wrap to zero -- at which point `base < hi` is still
+            // true and the scan walks the whole 2^61 steps of the address space one
+            // qword at a time while holding the only thread. Wrapping is simply the
+            // end of the window.
+            let Some(next) = base.checked_add(8) else {
+                break;
+            };
+            base = next;
         }
         if best.is_none() {
             self.ctx_miss = Some((any_rsp, best_rsp_only));
@@ -2683,7 +2756,17 @@ impl<'a> Emulator<'a> {
         retained: &mut [Ref],
     ) -> Stop {
         let mut ip = start;
-        for _ in 0..budget {
+        for i in 0..budget {
+            // The step budget is the deterministic limit on this block and normally
+            // the one that fires. The wall clock is checked here as well because a
+            // single block can outlast the whole recovery budget, and the caller's
+            // between-block check cannot see that until the block returns.
+            if i % DEADLINE_CHECK_INTERVAL == 0
+                && let Some(deadline) = self.deadline
+                && deadline.expired()
+            {
+                return Stop::Deadline { site: ip };
+            }
             if self.pe.section_for_va(ip).is_none() {
                 return Stop::OutOfImage { site: ip };
             }
@@ -3339,6 +3422,117 @@ mod compaction_tests {
         assert_eq!(
             emu.arena.op(retained[0]),
             &Op::Param(BlockRef(11), Reg::R12)
+        );
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::binary::pe::{PeFile, Section};
+    use std::time::Duration;
+
+    const IMAGE_BASE: u64 = 0x0001_4000_0000;
+    const START: u64 = IMAGE_BASE + 0x1000;
+
+    fn pe_with(code: &[u8]) -> PeFile {
+        let mut data = vec![0u8; 0x400];
+        data[0x200..0x200 + code.len()].copy_from_slice(code);
+        PeFile {
+            data,
+            image_base: IMAGE_BASE,
+            entry_point_rva: 0x1000,
+            size_of_image: 0x2000,
+            sections: vec![Section {
+                name: ".text".into(),
+                virtual_address: 0x1000,
+                virtual_size: 0x100,
+                raw_address: 0x200,
+                raw_size: 0x100,
+                characteristics: 0x2000_0000,
+            }],
+            opt_header_offset: 0,
+            section_table_offset: 0,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+            size_of_headers: 0x200,
+            loader_bound: Vec::new(),
+        }
+    }
+
+    /// `jmp $`: one instruction that stays in the block forever. The back-edge stop
+    /// only fires on an indirect dispatch, so a direct self-jump really does spin
+    /// until some budget stops it -- which is the shape that overshot the deadline.
+    const SPIN: &[u8] = &[0xeb, 0xfe];
+
+    #[test]
+    fn a_block_that_spins_aborts_at_the_deadline_instead_of_running_out_its_steps() {
+        let pe = pe_with(SPIN);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        const STEPS: usize = 200_000_000;
+        emu.deadline = Some(RecoveryDeadline::starting_now(Duration::from_millis(50)));
+
+        let started = std::time::Instant::now();
+        let stop = emu.run(START, STEPS);
+        let elapsed = started.elapsed();
+        let steps = emu.steps;
+
+        assert!(
+            matches!(stop, Stop::Deadline { site } if site == START),
+            "expected the wall clock to stop the block, got {stop:?}"
+        );
+        assert!(
+            steps < STEPS,
+            "the step budget, not the clock, ended the block ({steps} steps)"
+        );
+        // The point of the check: the overshoot is a few thousand instructions, not
+        // the whole step budget. The bound is loose on purpose -- it has to hold on a
+        // loaded machine -- but the run it replaces takes minutes.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "overshot a 50 ms deadline by {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "stopped before the deadline: {elapsed:?}"
+        );
+    }
+
+    /// Nothing in the inspection path sets a clock, so a caller that does not ask for
+    /// one keeps the old behaviour exactly: the step budget is the only limit.
+    #[test]
+    fn without_a_deadline_the_step_budget_is_the_only_limit() {
+        let pe = pe_with(SPIN);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        assert!(
+            emu.deadline.is_none(),
+            "inspecting must not install a clock"
+        );
+
+        assert!(matches!(emu.run(START, 64), Stop::Budget { site } if site == START));
+        assert_eq!(emu.steps, 64);
+    }
+
+    /// A block that finishes long before its deadline is untouched: same stop, same
+    /// site, same expression.
+    #[test]
+    fn a_generous_deadline_leaves_a_short_blocks_result_unchanged() {
+        let pe = pe_with(&[0xc3]);
+        let mut plain = Emulator::new(&pe, 0x7fff_ffff_0000);
+        let mut clocked = Emulator::new(&pe, 0x7fff_ffff_0000);
+        clocked.deadline = Some(RecoveryDeadline::starting_now(Duration::from_secs(600)));
+
+        let (Stop::Return { site: a, dest: da }, Stop::Return { site: b, dest: db }) =
+            (plain.run(START, 1), clocked.run(START, 1))
+        else {
+            panic!("a `ret` must end the block the same way with or without a clock")
+        };
+        assert_eq!(a, b);
+        assert_eq!(plain.steps, clocked.steps);
+        assert_eq!(
+            plain.arena.structural_hash(da, 8),
+            clocked.arena.structural_hash(db, 8),
+            "the returned expression must be identical"
         );
     }
 }
