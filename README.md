@@ -13,6 +13,16 @@
 - [`fix/pseudo-entry-filter`](https://github.com/NeuroSaki987/tvm-devirt-mirror/tree/fix/pseudo-entry-filter)：`entries` 默认过滤有字节证据的填充和伪入口，同时保留仅凭形状可疑的入口。可用 `--include-stubs` 恢复旧口径，或用 `--aggressive-shape-filter` 启用更激进的形状过滤。恢复入口集合保持不变。
 
 
+## 恢复改进候选
+
+本分支加入表达式强制位与内存字节提取修正，并恢复了两个此前未完成的实测入口。另提供三个默认关闭的恢复开关：
+
+- `TVM_EXTENDED_COMPARISONS=1`：已知位比较与常数搬移。
+- `TVM_BOOLEAN_CERTIFICATES=1`：证明共享布尔源组合恒真或恒假。
+- `TVM_JOIN_CONSTANT_REPLAY=1`：验证全部入边后重放 join 常量。
+
+高级配置在 mirror 的轻量对照中增加了完整恢复入口，也存在尚未全量复核的结构与性能代价。具体数据、预算和边界见[移植验证记录](validation/experiments/2026-10-15-mirror-recovery-port.md)。逐入口比较使用 `python tools/recovery_census.py --sample input.exe --out census.json`；可加 `--baseline old.json` 保留退化入口清单。设 `0` 或移除变量可关闭对应功能。
+
 ## 相比原项目增加了什么
 
 ```bash
@@ -87,3 +97,5 @@ cargo test --release
 ```
 
 See the [upstream repository](https://github.com/jz0/tvm-devirt) for the original project, its architecture, and the standard commands.
+
+Optional recovery additions on this branch: forced-bit and byte-extraction correctness fixes, bounded Boolean certification, and validated join-constant replay. Advanced comparison, Boolean certification and replay are opt-in through `TVM_EXTENDED_COMPARISONS`, `TVM_BOOLEAN_CERTIFICATES` and `TVM_JOIN_CONSTANT_REPLAY` (set to `1`; unset or `0` disables them). See the [port validation record](validation/experiments/2026-10-15-mirror-recovery-port.md) for measured gains and limits, and `tools/recovery_census.py` for per-entry baseline comparisons.

@@ -338,6 +338,10 @@ pub struct Arena {
     trunc_depth: u32,
     /// Maximum retained DAG depth measured by the most recent compaction.
     last_compaction_max_depth: usize,
+    /// Opt-in comparison rules with measured recovery gains and structural trade-offs.
+    extended_comparisons: bool,
+    boolean_certificates: HashMap<Ref, Option<u64>>,
+    boolean_certificate_mode: bool,
 }
 
 /// How many levels `trunc` is pushed through arithmetic before it is left in
@@ -359,13 +363,35 @@ impl Clone for Arena {
             known_one: HashMap::new(),
             trunc_depth: self.trunc_depth,
             last_compaction_max_depth: 0,
+            extended_comparisons: self.extended_comparisons,
+            boolean_certificates: HashMap::new(),
+            boolean_certificate_mode: self.boolean_certificate_mode,
         }
     }
 }
 
+/// Parse opt-in expression features without changing the process environment.
+///
+/// Only an explicitly truthy value enables it. Testing merely that the variable *exists* would
+/// make `TVM_EXTENDED_COMPARISONS=0` turn the mechanism on -- the opposite of what anybody
+/// writing `=0` means, and a silent way to change every measurement in a run that believed it
+/// had switched the mechanism off. Unset, empty and unrecognised values all mean off.
+///
+/// The decision is a pure function of the raw value so it can be tested without mutating the
+/// process environment, which no test running in parallel with another may do.
+fn bitwise_switch_is_on(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        None => false,
+    }
+}
+
+
 impl Arena {
     pub fn new() -> Self {
-        Self::default()
+        Self { extended_comparisons: bitwise_switch_is_on(std::env::var("TVM_EXTENDED_COMPARISONS").ok().as_deref()),
+            boolean_certificate_mode: bitwise_switch_is_on(std::env::var("TVM_BOOLEAN_CERTIFICATES").ok().as_deref()),
+            ..Self::default() }
     }
 
     /// How the arena is distributed, for diagnosing runaway growth.
@@ -643,6 +669,7 @@ impl Arena {
         self.intern = intern;
         self.known_zero.clear();
         self.known_one.clear();
+        self.boolean_certificates.clear();
         (remap, max_depth)
     }
 
@@ -1242,16 +1269,20 @@ impl Arena {
             (a, b)
         };
 
-        if let Some(r) = self.simplify_bin(op, a, b, width) {
-            return r;
+        let r = if let Some(r) = self.simplify_bin(op, a, b, width) {
+            r
+        } else {
+            self.intern(Node { op: Op::Bin(op, a, b), width })
+        };
+        // Prove comparison constants before they are stored into VM tables.
+        // Failed proofs preserve the original Ref and expression spelling.
+        if self.boolean_certificate_mode
+            && matches!(op,BinOp::Eq|BinOp::Ult|BinOp::Slt) && !self.is_const(r) {
+            if let Some(value)=self.certify_boolean(r) {return self.constant(value,Width::W8);}
         }
-        self.intern(Node {
-            op: Op::Bin(op, a, b),
-            width,
-        })
+        r
     }
 
-    /// Algebraic identities plus the Tencent VM MBA rule set. TVM builds large expressions by recursively applying a handful of trivial MBA identities.
     fn simplify_bin(&mut self, op: BinOp, a: Ref, b: Ref, width: Width) -> Option<Ref> {
         let mask = width.mask();
         let cb = self.as_const(b);
@@ -1343,6 +1374,24 @@ impl Arena {
             }
 
             BinOp::Sub => {
+                // x - (x^k) = 2*(x&k)-k. If every toggled bit of x is
+                // known, the difference is constant even when all other bits
+                // (including undefined flags) remain symbolic. Reverse order
+                // negates the result. Require equal widths, not register names.
+                for (base, toggled, reverse) in [(a, b, false), (b, a, true)] {
+                    if let Some((BinOp::Xor, x, kref)) = self.as_bin(toggled) {
+                        if x == base && self.width(base) == width && self.width(toggled) == width {
+                            if let Some(k) = self.as_const(kref) {
+                                let one = self.known_one(base);
+                                let zero = self.known_zero(base);
+                                if (one | zero) & k == k {
+                                    let delta = (one & k).wrapping_mul(2).wrapping_sub(k);
+                                    return Some(self.constant(if reverse { delta.wrapping_neg() } else { delta }, width));
+                                }
+                            }
+                        }
+                    }
+                }
                 if cb == Some(0) {
                     return Some(a);
                 }
@@ -1747,6 +1796,15 @@ impl Arena {
             }
 
             BinOp::Xor => {
+                // Toggling provably clear bits can only set them, so the XOR is an OR there.
+                // Measured alone this rule is a bait: it clears two frozen gap entries and breaks
+                // two entries this build otherwise recovers, because rewriting the term lets the
+                // engine continue into a larger region whose frontier it cannot yet close.
+                if let Some(k) = cb {
+                    if self.extended_comparisons && k != 0 && self.width(a) == width && self.known_zero(a) & k == k {
+                        return Some(self.bin(BinOp::Or, a, b));
+                    }
+                }
                 if a == b {
                     return Some(self.constant(0, width));
                 }
@@ -1810,11 +1868,14 @@ impl Arena {
                 if self.is_complement(a, b) {
                     return Some(self.constant(mask, width));
                 }
-                // (A | c1) ^ c2 where c1 & c2 == c1 -> A ^ (c1 ^ c2)
-                // This helps flatten nested constants in XOR chains
+                // Forced OR bits must first be cleared from A before merging
+                // XOR constants: (A|c1)^c2 = (A & ~c1) ^ (c1^c2).
+                // Omitting the mask restores A's overlapping bits and is wrong.
                 if let (Some(c2), Some((BinOp::Or, x, y))) = (cb, self.as_bin(a)) {
                     if let Some(c1) = self.as_const(y) {
-                        if (c1 & c2) == c1 {
+                        if (c1 & c2) == c1 && self.width(x) == width {
+                            let clear = self.constant(mask ^ c1, width);
+                            let x = self.bin(BinOp::And, x, clear);
                             let k = self.constant(c1 ^ c2, width);
                             return Some(self.bin(BinOp::Xor, x, k));
                         }
@@ -1884,12 +1945,37 @@ impl Arena {
                 if a == b {
                     return Some(self.constant(1, Width::W8));
                 }
+                // Move a constant term across the comparison first. `A + k == 0` is `A == -k`,
+                // and the same for a subtraction or a toggle, all modulo the operand width. This
+                // turns the VM's real branch destinations -- `((... ^ ...) + 0xffffffc0) == 0`
+                // and its relatives -- into the `value == constant` shape the tests below can
+                // decide; without it the constant stays buried inside the arithmetic and the
+                // known bits of the value are never consulted. Only the tests use the moved
+                // pair, so a comparison that stays symbolic keeps its original spelling.
+                if !self.extended_comparisons { return None; }
+                let (a, b) = self.eq_moved_constant(a, b);
+                // Known bits settle equality without either side being a constant node. A bit
+                // that is provably set on one side and provably clear on the other rules the
+                // comparison out; every bit known on both sides settles it either way. The VM
+                // builds branch destinations out of exactly such comparisons -- a term like
+                // `((... | 0xffffffc0) == 0)` cannot hold, and leaving it symbolic is what
+                // keeps the destination uncomputable.
+                if self.provably_differ(a, b) {
+                    return Some(self.constant(0, Width::W8));
+                }
+                if self.provably_equal(a, b) {
+                    return Some(self.constant(1, Width::W8));
+                }
                 None
             }
 
             BinOp::Ult | BinOp::Slt => {
                 if a == b {
                     return Some(self.constant(0, Width::W8));
+                }
+                if !self.extended_comparisons { return None; }
+                if let Some(verdict) = self.known_comparison(op, a, b) {
+                    return Some(self.constant(verdict, Width::W8));
                 }
                 None
             }
@@ -1901,6 +1987,125 @@ impl Arena {
     pub fn as_bin(&self, r: Ref) -> Option<(BinOp, Ref, Ref)> {
         match *self.op(r) {
             Op::Bin(o, a, b) => Some((o, a, b)),
+            _ => None,
+        }
+    }
+
+    /// The width two compared operands have to be read at, and that width's mask.
+    ///
+    /// `known_one`/`known_zero` answer within each node's own width and already treat bits above
+    /// it as clear, so reading both masks at the wider width is exactly zero-extension -- the
+    /// same thing the concrete evaluator does when it compares the two.
+    fn comparison_width_mask(&self, a: Ref, b: Ref) -> u64 {
+        self.width(a).max(self.width(b)).mask()
+    }
+
+    /// Bits that are provably set on one side and provably clear on the other.
+    ///
+    /// Any such bit makes the two values different, whatever the unknown inputs were, so this
+    /// is a proof of inequality that needs no constant operand.
+    fn differing_bits(&mut self, a: Ref, b: Ref) -> u64 {
+        let mask = self.comparison_width_mask(a, b);
+        let (a_one, a_zero) = (self.known_one(a) & mask, self.known_zero(a) & mask);
+        let (b_one, b_zero) = (self.known_one(b) & mask, self.known_zero(b) & mask);
+        (a_one & b_zero) | (a_zero & b_one)
+    }
+
+    fn provably_differ(&mut self, a: Ref, b: Ref) -> bool {
+        self.differing_bits(a, b) != 0
+    }
+
+    /// True when every bit of both sides is known and the known values agree, so the two values
+    /// are equal whatever the unknown inputs were.
+    fn provably_equal(&mut self, a: Ref, b: Ref) -> bool {
+        let mask = self.comparison_width_mask(a, b);
+        let a_one = self.known_one(a) & mask;
+        let b_one = self.known_one(b) & mask;
+        let a_known = a_one | (self.known_zero(a) & mask);
+        let b_known = b_one | (self.known_zero(b) & mask);
+        a_known == mask && b_known == mask && a_one == b_one
+    }
+
+    /// Move a constant term from one side of an equality to the other.
+    ///
+    /// `A + k == v` is `A == v - k`, `A - k == v` is `A == v + k`, `k - A == v` is `A == k - v`,
+    /// and `A ^ k == v` is `A == v ^ k`. Each is exact modulo the operand width, so no input is
+    /// assumed away. The pair is only handed to the known-bit tests, so a comparison that stays
+    /// symbolic keeps its original spelling and nothing about the arena grows.
+    ///
+    /// The VM's branch destinations bury their constant inside the arithmetic -- a real one reads
+    /// `((... ^ ...) + 0xffffffc0) == 0` -- and without this the known bits of the value are never
+    /// consulted because the constant is not adjacent to the comparison.
+    fn eq_moved_constant(&mut self, a: Ref, b: Ref) -> (Ref, Ref) {
+        for (value, constant) in [(a, b), (b, a)] {
+            // The arithmetic is modular at the width of the operation being undone, which is also
+            // the width the comparison reads that side at. Using the operand's own width keeps the
+            // rewritten comparison at that arithmetic width. A wider RHS must
+            // first be representable there; otherwise retain the original pair.
+            let width = self.width(value);
+            let Some(k) = self.as_const(constant) else { continue };
+            // A narrower value is zero-extended by the original comparison.
+            // A wider RHS outside that value's range cannot be reduced modulo
+            // the narrow width: doing so can turn an impossible equality true.
+            if k & !width.mask() != 0 { continue; }
+            let Some((op, x, y)) = self.as_bin(value) else { continue };
+            if let Some(c) = self.as_const(y) {
+                let moved = match op {
+                    BinOp::Add => k.wrapping_sub(c),
+                    BinOp::Sub => k.wrapping_add(c),
+                    BinOp::Xor => k ^ c,
+                    _ => continue,
+                };
+                return (x, self.constant(moved, width));
+            }
+            // `c - A == k` is the one case where the constant is the operation's left operand.
+            if op == BinOp::Sub {
+                if let Some(c) = self.as_const(x) {
+                    return (y, self.constant(c.wrapping_sub(k), width));
+                }
+            }
+        }
+        (a, b)
+    }
+
+    /// The verdict of a comparison the operands' known bits already settle, if any.
+    /// Every value lies in the interval its known bits spell out: at least the number its set
+    /// bits form, at most that plus every bit that is not known clear. Two disjoint intervals
+    /// decide the comparison without evaluating either side.
+    fn known_comparison(&mut self, op: BinOp, a: Ref, b: Ref) -> Option<u64> {
+        let mask = self.comparison_width_mask(a, b);
+        let a_low = self.known_one(a) & mask;
+        let a_high = mask ^ (self.known_zero(a) & mask);
+        let b_low = self.known_one(b) & mask;
+        let b_high = mask ^ (self.known_zero(b) & mask);
+        match op {
+            BinOp::Ult => {
+                if a_low >= b_high {
+                    Some(0)
+                } else if a_high < b_low {
+                    Some(1)
+                } else {
+                    None
+                }
+            }
+            // Signed comparison is only decided here by the sign bits, which the same interval
+            // endpoints already expose. Comparing the intervals as signed would need both ends
+            // interpreted in the narrower width, and the sign test covers the VM's idiom:
+            // a negative value is below a non-negative one.
+            BinOp::Slt => {
+                let sign = mask ^ (mask >> 1);
+                let a_sign = self.known_one(a) & sign != 0;
+                let a_clear = self.known_zero(a) & sign != 0;
+                let b_sign = self.known_one(b) & sign != 0;
+                let b_clear = self.known_zero(b) & sign != 0;
+                if a_sign && b_clear {
+                    Some(1)
+                } else if a_clear && b_sign {
+                    Some(0)
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -2458,6 +2663,279 @@ mod tests {
 
     fn sym(a: &mut Arena, name: Reg) -> Ref {
         a.init_reg(name)
+    }
+
+    #[test]
+    fn bitwise_switch_is_off_for_every_value_that_is_not_explicitly_truthy() {
+        for on in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(bitwise_switch_is_on(Some(on)), "{on:?} should enable the mechanism");
+        }
+        // `0` is the case that matters: reading the variable's mere existence made it enable
+        // the mechanism, so a run that set `=0` to switch the work off measured the opposite.
+        for off in [None, Some(""), Some(" "), Some("0"), Some("false"), Some("FALSE"),
+                    Some("no"), Some("off"), Some("2"), Some("tru")] {
+            assert!(!bitwise_switch_is_on(off), "{off:?} must not enable the mechanism");
+        }
+    }
+
+    /// A folded comparison must be the same answer evaluation gives, at every input.
+    ///
+    /// Folding is only a simplification if it agrees with the semantics; a fold that disagrees
+    /// is a wrong branch decision, and wrong branch decisions are what the engine turns into
+    /// either a lost entry or an address that leaves the image. So this checks the folded
+    /// constant against the operands' own evaluated values across the whole byte range, over
+    /// the masked and the OR'd forms that narrow known zeros and known ones respectively.
+    #[test]
+    fn extended_rules_do_not_change_default_expression_shapes() {
+        let mut a = Arena::new(); a.extended_comparisons = false;
+        let x = a.init_reg(Reg::Rcx);
+        let keep = a.constant(!0x40u64, Width::W64);
+        let cleared = a.bin(BinOp::And, x, keep);
+        let bit = a.constant(0x40, Width::W64);
+        let toggled = a.bin(BinOp::Xor, cleared, bit);
+        assert!(matches!(a.op(toggled), Op::Bin(BinOp::Xor, _, _)));
+        let packed = a.bin(BinOp::Or, x, bit);
+        let zero = a.constant(0, Width::W64);
+        let comparison = a.bin(BinOp::Eq, packed, zero);
+        assert!(!a.is_const(comparison));
+        a.extended_comparisons = true;
+        let toggled = a.bin(BinOp::Xor, cleared, bit);
+        assert!(matches!(a.op(toggled), Op::Bin(BinOp::Or, _, _)));
+        let comparison = a.bin(BinOp::Eq, packed, zero);
+        assert_eq!(a.as_const(comparison), Some(0));
+    }
+    #[test]
+    fn known_bit_comparisons_agree_with_evaluation_over_every_byte() {
+        let masks = [0u64, 1, 2, 0x0f, 0x10, 0x80, 0xa5, 0xff];
+        let mut folded = 0;
+        for k in masks {
+            for op in [BinOp::Eq, BinOp::Ult, BinOp::Slt] {
+                for or_form in [false, true] {
+                    let mut a = Arena::new(); a.extended_comparisons = true;
+                    let raw = a.init_reg(Reg::Rcx);
+                    let x = a.trunc(raw, Width::W8);
+                    let kk = a.constant(k, Width::W8);
+                    let lhs = if or_form {
+                        a.bin(BinOp::Or, x, kk)
+                    } else {
+                        a.bin(BinOp::And, x, kk)
+                    };
+                    let rhs = a.constant(0x10, Width::W8);
+                    let cmp = a.bin(op, lhs, rhs);
+                    let got = a.as_const(cmp);
+                    if got.is_some() {
+                        folded += 1;
+                    }
+                    for v in 0u64..256 {
+                        let env = HashMap::from([(Reg::Rcx, v)]);
+                        let lv = eval(&a, lhs, &env);
+                        let rv = eval(&a, rhs, &env);
+                        let expect = match op {
+                            BinOp::Eq => u64::from(lv == rv),
+                            BinOp::Ult => u64::from(lv < rv),
+                            BinOp::Slt => u64::from((lv as i8) < (rv as i8)),
+                            other => unreachable!("not a comparison: {other:?}"),
+                        };
+                        assert_eq!(eval(&a, cmp, &env), expect,
+                                   "op={op:?} k={k:#x} or={or_form} v={v:#x}");
+                    }
+                }
+            }
+        }
+        assert!(folded >= 8, "the known-bit folds barely fired ({folded})");
+    }
+
+    #[test]
+    fn comparison_folds_on_a_provably_set_bit() {
+        // The shape a real failing entry presents: `((... | 0xffffffc0) == 0)` cannot hold,
+        // because the OR forces bits that the zero side does not have. Leaving it symbolic is
+        // what keeps the branch destination uncomputable.
+        let mut a = Arena::new(); a.extended_comparisons = true;
+        let raw = a.init_reg(Reg::Rcx);
+        let x = a.trunc(raw, Width::W32);
+        let forced = a.constant(0xffffffc0, Width::W32);
+        let or = a.bin(BinOp::Or, x, forced);
+        let zero = a.constant(0, Width::W32);
+        let eq = a.bin(BinOp::Eq, or, zero);
+        assert_eq!(a.as_const(eq), Some(0));
+
+        // Two structurally unrelated values that are both provably all ones compare equal.
+        let other_raw = a.init_reg(Reg::Rdx);
+        let other = a.trunc(other_raw, Width::W32);
+        let ones = a.constant(0xffffffff, Width::W32);
+        let left = a.bin(BinOp::Or, x, ones);
+        let right = a.bin(BinOp::Or, other, ones);
+        let eq = a.bin(BinOp::Eq, left, right);
+        assert_eq!(a.as_const(eq), Some(1));
+    }
+
+    #[test]
+    fn comparison_folds_from_known_bit_intervals() {
+        let mut a = Arena::new(); a.extended_comparisons = true;
+        let raw = a.init_reg(Reg::Rcx);
+        let x = a.trunc(raw, Width::W32);
+        let low_byte = a.constant(0xff, Width::W32);
+        let high = a.constant(0x100, Width::W32);
+
+        // The low byte of `x & 0xff` is below 0x100 whatever x is.
+        let masked = a.bin(BinOp::And, x, low_byte);
+        let below = a.bin(BinOp::Ult, masked, high);
+        assert_eq!(a.as_const(below), Some(1));
+
+        // `x | 0x100` is at least 0x100, so it is never below 0x100.
+        let forced = a.bin(BinOp::Or, x, high);
+        let not_below = a.bin(BinOp::Ult, forced, high);
+        assert_eq!(a.as_const(not_below), Some(0));
+
+        // A forced sign bit puts the value below any non-negative one.
+        let sign = a.constant(0x80000000, Width::W32);
+        let negative = a.bin(BinOp::Or, x, sign);
+        let below_unsigned = a.bin(BinOp::Slt, negative, high);
+        assert_eq!(a.as_const(below_unsigned), Some(1));
+    }
+
+    #[test]
+    fn comparisons_the_known_bits_do_not_settle_stay_symbolic() {
+        // `x & 0xff` may or may not be zero and may or may not be below 0x10, so neither
+        // comparison is decided. Folding either would decide a branch the inputs do not decide,
+        // which is the failure mode worth guarding against.
+        let mut a = Arena::new(); a.extended_comparisons = true;
+        let raw = a.init_reg(Reg::Rcx);
+        let x = a.trunc(raw, Width::W32);
+        let low_byte = a.constant(0xff, Width::W32);
+        let masked = a.bin(BinOp::And, x, low_byte);
+        let zero = a.constant(0, Width::W32);
+        let eq = a.bin(BinOp::Eq, masked, zero);
+        assert_eq!(a.as_const(eq), None);
+        let sixteen = a.constant(0x10, Width::W32);
+        let ult = a.bin(BinOp::Ult, masked, sixteen);
+        assert_eq!(a.as_const(ult), None);
+        let slt = a.bin(BinOp::Slt, masked, sixteen);
+        assert_eq!(a.as_const(slt), None);
+
+        // `x <u 0` is false for every unsigned value, so this one *is* decided and must fold.
+        let impossible = a.bin(BinOp::Ult, masked, zero);
+        assert_eq!(a.as_const(impossible), Some(0));
+
+        // An 8-bit value against a 32-bit constant is read at the wider width, so the value's
+        // high bits are known clear and the comparison is decidable.
+        let raw2 = a.init_reg(Reg::Rdx);
+        let byte = a.trunc(raw2, Width::W8);
+        let high = a.constant(0x100, Width::W32);
+        let below = a.bin(BinOp::Ult, byte, high);
+        assert_eq!(a.as_const(below), Some(1));
+    }
+
+    /// A constant buried inside the arithmetic must still be usable by the comparison.
+    ///
+    /// `known_zero`/`known_one` cannot see through `Add`, so `(x + k) == v` stays symbolic even
+    /// when `x == v - k` is decided by bits that are known on `x`. Every case here is chosen so
+    /// that the moved form is decidable and the buried form is not, which is what makes the test
+    /// fail if the move is removed rather than merely renamed.
+    #[test]
+    fn equality_moves_a_buried_constant_into_the_comparison() {
+        let mut a = Arena::new(); a.extended_comparisons = true;
+        let raw = a.init_reg(Reg::Rcx);
+        let byte = a.constant(0xff, Width::W32);
+        let x = a.bin(BinOp::And, raw, byte);
+        let zero = a.constant(0, Width::W32);
+
+        // (x + 0x100) == 0x1000  is  x == 0xf00, and x cannot hold bit 8 or above.
+        let k100 = a.constant(0x100, Width::W32);
+        let k1000 = a.constant(0x1000, Width::W32);
+        let sum = a.bin(BinOp::Add, x, k100);
+        let eq = a.bin(BinOp::Eq, sum, k1000);
+        assert_eq!(a.as_const(eq), Some(0));
+
+        // (x - 0xf00) == 0  is  x == 0xf00, same reasoning.
+        let kf00 = a.constant(0xf00, Width::W32);
+        let diff = a.bin(BinOp::Sub, x, kf00);
+        let eq = a.bin(BinOp::Eq, diff, zero);
+        assert_eq!(a.as_const(eq), Some(0));
+
+        // (0x1000 - x) == 0x100  is  x == 0xf00, where the constant is the left operand.
+        let reversed = a.bin(BinOp::Sub, k1000, x);
+        let eq = a.bin(BinOp::Eq, reversed, k100);
+        assert_eq!(a.as_const(eq), Some(0));
+
+        // (x ^ 0x1000) == 0x1000  is  x == 0, and x's low byte is unknown, so this must not fold.
+        let toggled = a.bin(BinOp::Xor, x, k1000);
+        let eq = a.bin(BinOp::Eq, toggled, k1000);
+        assert_eq!(a.as_const(eq), None);
+
+        // The move must not invent a verdict for an undecidable comparison either.
+        let one = a.constant(1, Width::W32);
+        let sum = a.bin(BinOp::Add, x, one);
+        let eq = a.bin(BinOp::Eq, sum, one);
+        assert_eq!(a.as_const(eq), None);
+    }
+
+    #[test]
+    fn xor_of_forced_bits_never_restores_overlapping_input_bits() {
+        for w in [Width::W8, Width::W16, Width::W32, Width::W64] {
+            let mut a = Arena::new();
+            let raw = a.init_reg(Reg::Rcx);
+            let x = a.trunc(raw, w);
+            let forced = a.constant(0x40, w);
+            let packed = a.bin(BinOp::Or, x, forced);
+            let toggled = a.constant(0x60, w);
+            let result = a.bin(BinOp::Xor, packed, toggled);
+            for v in [0u64, 0x40, 0x46, w.mask()] {
+                let env = HashMap::from([(Reg::Rcx, v)]);
+                assert_eq!(eval(&a, result, &env), ((v | 0x40) ^ 0x60) & w.mask());
+            }
+        }
+    }
+
+    #[test]
+    fn xor_difference_cancels_known_flag_bits() {
+        for w in [Width::W8, Width::W16, Width::W32, Width::W64] {
+            let mut a = Arena::new();
+            let raw = a.init_reg(Reg::Rcx);
+            let input = a.trunc(raw, w);
+            let pack_mask = a.constant(0x46, w);
+            let packed = a.bin(BinOp::Or, input, pack_mask);
+            let toggle = a.constant(0x40, w);
+            let changed = a.bin(BinOp::Xor, packed, toggle);
+            let delta = a.bin(BinOp::Sub, packed, changed);
+            assert_eq!(a.as_const(delta), Some(0x40));
+            let reverse = a.bin(BinOp::Sub, changed, packed);
+            assert_eq!(a.as_const(reverse), Some(0u64.wrapping_sub(0x40) & w.mask()));
+        }
+    }
+
+    #[test]
+    fn xor_difference_handles_known_zero_and_mixed_bits() {
+        let mut a = Arena::new();
+        let raw = a.init_reg(Reg::Rcx);
+        let input = a.trunc(raw, Width::W8);
+        let clear = a.constant(0xf0, Width::W8);
+        let x = a.bin(BinOp::And, input, clear);
+        let one = a.constant(5, Width::W8);
+        let x = a.bin(BinOp::Or, x, one);
+        let k = a.constant(6, Width::W8);
+        let y = a.bin(BinOp::Xor, x, k);
+        let delta = a.bin(BinOp::Sub, x, y);
+        assert_eq!(a.as_const(delta), Some(2)); // 2*(5 & 6) - 6 mod 256
+        for v in 0u64..256 {
+            let env = HashMap::from([(Reg::Rcx, v)]);
+            let concrete = ((v & 0xf0) | 5) as u8;
+            assert_eq!(eval(&a, delta, &env), concrete.wrapping_sub(concrete ^ 6) as u64);
+        }
+    }
+
+    #[test]
+    fn xor_difference_keeps_unknown_toggled_bits() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rcx);
+        let k = a.constant(0x40, Width::W64);
+        let y = a.bin(BinOp::Xor, x, k);
+        let delta = a.bin(BinOp::Sub, x, y);
+        assert!(a.as_const(delta).is_none());
+        for v in [0u64, 0x40, u64::MAX] {
+            let env = HashMap::from([(Reg::Rcx, v)]);
+            assert_eq!(eval(&a, delta, &env), v.wrapping_sub(v ^ 0x40));
+        }
     }
 
     /// Nodes are hash-consed, so a load must carry the memory generation to
@@ -3750,5 +4228,324 @@ mod vmctx_addr_tests {
              got: {}",
             render(&a, result, 24),
         );
+    }
+}
+
+#[cfg(test)]
+mod equality_move_width_tests {
+    use super::*;
+    #[test]
+    fn a_wide_comparison_constant_must_not_wrap_to_the_narrow_arithmetic_width() {
+        let mut a=Arena::new(); a.extended_comparisons = true; let x=a.opaque("width-test",Width::W32);
+        let mask=a.constant(u32::MAX as u64,Width::W32);
+        // Raw nodes deliberately keep a known constant's symbolic spelling.
+        let all_ones=a.intern(Node {op:Op::Bin(BinOp::Or,x,mask),width:Width::W32});
+        let one=a.constant(1,Width::W32);
+        let sum=a.intern(Node {op:Op::Bin(BinOp::Add,all_ones,one),width:Width::W32});
+        let impossible=a.constant(1u64<<32,Width::W64);
+        let comparison=a.bin(BinOp::Eq,sum,impossible);
+        assert_eq!(a.as_const(comparison),Some(0),"zero-extended W32 cannot equal 2^32");
+    }
+    #[test]
+    fn a_wider_constant_that_fits_still_allows_modular_equality_movement() {
+        let mut a=Arena::new(); a.extended_comparisons = true; let x=a.opaque("width-test",Width::W32);
+        let mask=a.constant(u32::MAX as u64,Width::W32);
+        let all_ones=a.intern(Node {op:Op::Bin(BinOp::Or,x,mask),width:Width::W32});
+        let one=a.constant(1,Width::W32);
+        let sum=a.intern(Node {op:Op::Bin(BinOp::Add,all_ones,one),width:Width::W32});
+        let zero=a.constant(0,Width::W64);
+        let comparison=a.bin(BinOp::Eq,sum,zero);
+        assert_eq!(a.as_const(comparison),Some(1));
+    }
+}
+
+#[cfg(test)]
+mod boolean_certificate_tests {
+    use super::*;
+    fn raw(a: &mut Arena, op: BinOp, l: Ref, r: Ref, w: Width) -> Ref {
+        a.intern(Node {
+            op: Op::Bin(op, l, r),
+            width: w,
+        })
+    }
+    #[test]
+    fn certificates_preserve_shared_flags_through_differently_packed_words() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rcx);
+        let y = a.init_reg(Reg::Rdx);
+        let zero = a.constant(0, Width::W64);
+        let p = a.bin(BinOp::Eq, x, zero);
+        let byte = a.trunc(y, Width::W8);
+        let q = a.un(UnOp::ParityByte, byte);
+        let pp = a.zext(p, Width::W32);
+        let qq = a.zext(q, Width::W32);
+        let seven = a.constant(7, Width::W32);
+        let two = a.constant(2, Width::W32);
+        let ps = raw(&mut a, BinOp::Shl, pp, seven, Width::W32);
+        let qs = raw(&mut a, BinOp::Shl, qq, two, Width::W32);
+        let fixed = a.constant(2, Width::W32);
+        let left0 = raw(&mut a, BinOp::Or, ps, qs, Width::W32);
+        let left = raw(&mut a, BinOp::Or, left0, fixed, Width::W32);
+        let right0 = raw(&mut a, BinOp::Or, qs, fixed, Width::W32);
+        let right = raw(&mut a, BinOp::Or, ps, right0, Width::W32);
+        let root = raw(&mut a, BinOp::Eq, left, right, Width::W8);
+        let before = a.len();
+        assert_eq!(a.certify_boolean(root), Some(1));
+        assert_eq!(
+            a.len(),
+            before,
+            "certification must not allocate speculative IR"
+        );
+    }
+    #[test]
+    fn construction_certifies_before_a_condition_can_enter_memory() {
+        let mut a = Arena::new();
+        a.boolean_certificate_mode = true;
+        let x = a.init_reg(Reg::Rcx);
+        let y = a.init_reg(Reg::Rdx);
+        let zero = a.constant(0, Width::W64);
+        let p = a.bin(BinOp::Eq, x, zero);
+        assert!(
+            !a.is_const(p),
+            "guest-dependent predicate must remain symbolic"
+        );
+        let byte = a.trunc(y, Width::W8);
+        let q = a.un(UnOp::ParityByte, byte);
+        let pp = a.zext(p, Width::W32);
+        let qq = a.zext(q, Width::W32);
+        let fixed = a.constant(2, Width::W32);
+        let left0 = raw(&mut a, BinOp::Or, pp, qq, Width::W32);
+        let left = raw(&mut a, BinOp::Or, left0, fixed, Width::W32);
+        let right0 = raw(&mut a, BinOp::Or, qq, fixed, Width::W32);
+        let right = raw(&mut a, BinOp::Or, pp, right0, Width::W32);
+        let condition = a.bin(BinOp::Eq, left, right);
+        assert_eq!(a.as_const(condition), Some(1));
+        let v1 = a.constant(77, Width::W32);
+        let v2 = a.constant(99, Width::W32);
+        assert_eq!(a.select(condition, v1, v2), v1);
+        // A similar packing with one genuinely different flag is not an identity.
+        let z = a.init_reg(Reg::Rax);
+        let other = a.bin(BinOp::Eq, z, zero);
+        let other = a.zext(other, Width::W32);
+        let different = raw(&mut a, BinOp::Or, other, right0, Width::W32);
+        let varying = a.bin(BinOp::Eq, left, different);
+        assert!(!a.is_const(varying));
+    }
+    #[test]
+    fn certificate_cache_is_discarded_when_references_are_remapped_or_cloned() {
+        let mut a = Arena::new();
+        a.boolean_certificate_mode = true;
+        let _dead = a.opaque("discarded-before-certificate", Width::W64);
+        let x = a.init_reg(Reg::Rcx);
+        let zero = a.constant(0, Width::W64);
+        let p = a.bin(BinOp::Eq, x, zero);
+        let one = a.constant(1, Width::W8);
+        let opposite = raw(&mut a, BinOp::Xor, p, one, Width::W8);
+        let always_one = raw(&mut a, BinOp::Xor, p, opposite, Width::W8);
+        let root = raw(&mut a, BinOp::Eq, always_one, one, Width::W8);
+        assert_eq!(a.certify_boolean(root), Some(1));
+        assert!(!a.boolean_certificates.is_empty());
+        let cloned = a.clone();
+        assert!(cloned.boolean_certificates.is_empty());
+        assert!(cloned.boolean_certificate_mode);
+        let mapping = a.compact(&[root]);
+        assert!(a.boolean_certificates.is_empty());
+        assert!(a.boolean_certificate_mode);
+        assert_eq!(a.certify_boolean(mapping[&root]), Some(1));
+    }
+    #[test]
+    fn certificate_evaluation_keeps_operand_widths_and_signed_extensions() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rcx);
+        let zero = a.constant(0, Width::W64);
+        let p = a.bin(BinOp::Eq, x, zero);
+        let one = a.constant(1, Width::W8);
+        let opposite = raw(&mut a, BinOp::Xor, p, one, Width::W8);
+        let ff = a.constant(255, Width::W8);
+        let sum = raw(&mut a, BinOp::Add, p, ff, Width::W8);
+        let wide = a.constant(256, Width::W64);
+        let cannot_wrap = raw(&mut a, BinOp::Eq, sum, wide, Width::W8);
+        assert_eq!(a.certify_boolean(cannot_wrap), Some(0));
+        let neg = a.intern(Node {
+            op: Op::Un(UnOp::Neg, p),
+            width: Width::W8,
+        });
+        let extended = a.intern(Node {
+            op: Op::Sext(neg),
+            width: Width::W64,
+        });
+        let max = a.constant(u64::MAX, Width::W64);
+        let choice = a.intern(Node {
+            op: Op::Select(opposite, zero, max),
+            width: Width::W64,
+        });
+        let eq = raw(&mut a, BinOp::Eq, extended, choice, Width::W8);
+        assert_eq!(a.certify_boolean(eq), Some(1));
+    }
+    #[test]
+    fn certificates_keep_boolean_relations_and_refuse_input_dependent_conditions() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rcx);
+        let z = a.constant(0, Width::W64);
+        let p = a.bin(BinOp::Eq, x, z);
+        let one = a.constant(1, Width::W8);
+        let opposite = raw(&mut a, BinOp::Xor, p, one, Width::W8);
+        let never = raw(&mut a, BinOp::Eq, p, opposite, Width::W8);
+        assert_eq!(a.certify_boolean(never), Some(0));
+        assert_eq!(a.certify_boolean(p), None);
+    }
+}
+
+impl Arena {
+    /// Certify a Boolean expression over its shared primitive Boolean sources.
+    /// Every valuation must fold to the same answer; unknown words, too many
+    /// variables, or varying answers decline the proof. No memory is sampled.
+    pub fn certify_boolean(&mut self, root: Ref) -> Option<u64> {
+        if let Some(&result) = self.boolean_certificates.get(&root) {
+            return result;
+        }
+        let result = self.certify_boolean_uncached(root);
+        if self.boolean_certificates.len() >= 4096 {
+            self.boolean_certificates.clear();
+        }
+        self.boolean_certificates.insert(root, result);
+        result
+    }
+
+    fn certify_boolean_uncached(&mut self, root: Ref) -> Option<u64> {
+        if self.known_zero(root) | 1 != u64::MAX {
+            return None;
+        }
+        if let Some(c) = self.as_const(root) {
+            return Some(c);
+        }
+        // A comparison/parity/mask over an unknown word is a primitive Boolean
+        // source. A Boolean combination of other Boolean sources is expanded,
+        // preserving relations instead of making every condition independent.
+        fn has_word_input(a: &mut Arena, root: Ref) -> Option<bool> {
+            if matches!(
+                a.op(root),
+                Op::Load(..) | Op::InitReg(..) | Op::Param(..) | Op::Opaque(..)
+            ) {
+                return Some(true);
+            }
+            let mut todo = a.children(root);
+            let mut seen = HashSet::new();
+            while let Some(r) = todo.pop() {
+                if !seen.insert(r) {
+                    continue;
+                }
+                if seen.len() > 128 {
+                    return None;
+                }
+                if a.is_const(r) || a.known_zero(r) | 1 == u64::MAX {
+                    continue;
+                }
+                match a.op(r) {
+                    Op::Load(..) | Op::InitReg(..) | Op::Param(..) | Op::Opaque(..) => {
+                        return Some(true);
+                    }
+                    _ => todo.extend(a.children(r)),
+                }
+            }
+            Some(false)
+        }
+        let mut todo = vec![root];
+        let mut seen = HashSet::new();
+        let mut atoms = Vec::new();
+        while let Some(r) = todo.pop() {
+            if !seen.insert(r) {
+                continue;
+            }
+            if seen.len() > 512 {
+                return None;
+            }
+            if r != root
+                && !self.is_const(r)
+                && self.known_zero(r) | 1 == u64::MAX
+                && has_word_input(self, r)?
+            {
+                atoms.push(r);
+                if atoms.len() > 6 {
+                    return None;
+                }
+                continue;
+            }
+            // This certificate handles Boolean-controlled word expressions,
+            // not unrestricted guest words. Decline before valuation when a
+            // word leaf escapes the Boolean frontier; otherwise every row
+            // would repeat a rewrite that cannot discharge that leaf.
+            if matches!(
+                self.op(r),
+                Op::Load(..) | Op::InitReg(..) | Op::Param(..) | Op::Opaque(..)
+            ) {
+                return None;
+            }
+            todo.extend(self.children(r));
+        }
+        if atoms.is_empty() {
+            return None;
+        }
+        atoms.sort();
+        // Evaluate a bounded slice directly instead of rebuilding the arena for
+        // each assignment. This proof never invokes symbolic rewrite rules and
+        // never allocates speculative IR nodes.
+        let mut order = Vec::new();
+        let mut scheduled = HashSet::new();
+        let mut pending = vec![(root, false)];
+        while let Some((r, ready)) = pending.pop() {
+            if ready {
+                order.push(r);
+                continue;
+            }
+            if !scheduled.insert(r) {
+                continue;
+            }
+            pending.push((r, true));
+            if atoms.binary_search(&r).is_err() {
+                pending.extend(self.children(r).into_iter().map(|c| (c, false)));
+            }
+        }
+        let indices: HashMap<Ref, usize> = order.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+        let mut values = vec![0u64; order.len()];
+        let mut verdict = None;
+        for row in 0usize..(1usize << atoms.len()) {
+            for (i, &r) in order.iter().enumerate() {
+                let value = if let Ok(bit) = atoms.binary_search(&r) {
+                    ((row >> bit) & 1) as u64
+                } else {
+                    let get = |c: Ref| values[indices[&c]];
+                    match *self.op(r) {
+                        Op::Const(k) => k,
+                        Op::Bin(op, l, r) => {
+                            fold_bin(op, get(l), get(r), self.width(l).max(self.width(r)))?
+                        }
+                        Op::Un(UnOp::Not, c) => !get(c),
+                        Op::Un(UnOp::Neg, c) => get(c).wrapping_neg(),
+                        Op::Un(UnOp::ParityByte, c) => {
+                            ((get(c) as u8).count_ones() % 2 == 0) as u64
+                        }
+                        Op::Un(UnOp::Bswap, c) => bswap(get(c), self.width(c)),
+                        Op::Zext(c) | Op::Trunc(c) => get(c),
+                        Op::Sext(c) => sign_extend(get(c), self.width(c)),
+                        Op::Select(c, t, f) => {
+                            if get(c) != 0 {
+                                get(t)
+                            } else {
+                                get(f)
+                            }
+                        }
+                        _ => return None,
+                    }
+                };
+                values[i] = value & self.width(r).mask();
+            }
+            let value = values[indices[&root]];
+            if value > 1 || verdict.is_some_and(|v| v != value) {
+                return None;
+            }
+            verdict = Some(value);
+        }
+        verdict
     }
 }
