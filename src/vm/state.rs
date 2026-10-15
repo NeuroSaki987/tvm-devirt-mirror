@@ -318,20 +318,24 @@ impl State {
                         j += 1;
                     }
                     let len = j - i;
-                    // Bring the source to the load's width before shifting, so the
-                    // shifts and masks below are all one width.
+                    // Select in the original word before narrowing. Truncating
+                    // first would erase a read of its high bytes entirely.
                     let src_w = arena.width(expr);
-                    let mut t = if src_w == width {
-                        expr
-                    } else if src_w.bits() < width.bits() {
-                        arena.zext(expr, width)
+                    let mut t = expr;
+                    if index >= src_w.bytes() {
+                        t = arena.constant(0, width);
                     } else {
-                        arena.trunc(expr, width)
-                    };
-                    // Select bytes `index .. index+len` of the source ...
-                    if index > 0 {
-                        let sh = arena.constant(index as u64 * 8, width);
-                        t = arena.bin(BinOp::Shr, t, sh);
+                        if index > 0 {
+                            let sh = arena.constant(index as u64 * 8, src_w);
+                            t = arena.bin(BinOp::Shr, t, sh);
+                        }
+                        t = if src_w == width {
+                            t
+                        } else if src_w.bits() < width.bits() {
+                            arena.zext(t, width)
+                        } else {
+                            arena.trunc(t, width)
+                        };
                     }
                     // ... masking only when the run is narrower than the result, so a
                     // run covering the whole load needs no mask at all.
@@ -463,5 +467,46 @@ mod root_tests {
         }));
 
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod memory_byte_projection_tests {
+    use super::*;
+    #[test]
+    fn high_bytes_of_symbolic_words_are_extracted_before_narrowing() {
+        let mut a = Arena::new();
+        let mut state = State::new(&mut a, 0x10000);
+        let x = a.init_reg(Reg::Rax);
+        state.store_concrete(&a, 0x20000, x, Width::W64);
+        let got = state
+            .load_concrete(&mut a, 0x20004, Width::W32, |_| None)
+            .unwrap();
+        let sh = a.constant(32, Width::W64);
+        let shifted = a.bin(BinOp::Shr, x, sh);
+        let expected = a.trunc(shifted, Width::W32);
+        assert_eq!(got, expected);
+    }
+    #[test]
+    fn every_in_bounds_symbolic_word_slice_keeps_its_source_bits() {
+        let mut a = Arena::new();
+        let mut state = State::new(&mut a, 0x10000);
+        let x = a.init_reg(Reg::Rax);
+        state.store_concrete(&a, 0x20000, x, Width::W64);
+        for width in [Width::W8, Width::W16, Width::W32, Width::W64] {
+            for offset in 0..=8 - width.bytes() {
+                let got = state
+                    .load_concrete(&mut a, 0x20000 + offset as u64, width, |_| None)
+                    .unwrap();
+                let shifted = if offset == 0 {
+                    x
+                } else {
+                    let shift = a.constant(8 * offset as u64, Width::W64);
+                    a.bin(BinOp::Shr, x, shift)
+                };
+                let expected = a.trunc(shifted, width);
+                assert_eq!(got, expected, "width={width:?}, offset={offset}");
+            }
+        }
     }
 }
