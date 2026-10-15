@@ -336,6 +336,7 @@ pub struct Explorer<'a> {
 
     /// Name of the section holding VM bytecode.
     vm_section: String,
+    retry_deadline: Option<crate::ir::lift::RecoveryDeadline>,
 }
 
 impl<'a> Explorer<'a> {
@@ -349,6 +350,7 @@ impl<'a> Explorer<'a> {
             work_budget: 24_000_000,
             verbose: false,
             vm_section: crate::vm::DEFAULT_VM_SECTION.to_string(),
+            retry_deadline: None,
         }
     }
 
@@ -362,6 +364,48 @@ impl<'a> Explorer<'a> {
 
     /// Recover the CFG of the virtualized function entered at `start`. Runs recovery twice. The first pass discovers the graph shape; the second re-runs it knowing which blocks are joins, and cuts SSA parameters only there.
     pub fn recover(&self, start: u64) -> Cfg {
+        let started = crate::ir::lift::RecoveryDeadline::starting_now(self.time_budget);
+        let candidate = self.recover_configured(start);
+        let clean = validate(&candidate).is_clean();
+        // Clean partial results are normal under the default recovery rules.
+        // Only advanced algebra needs an alternate attempt for lost closure;
+        // an invalid structure always needs one, including in default mode.
+        if clean && (candidate.unresolved == 0 || !expr::advanced_recovery_enabled()) {
+            return candidate;
+        }
+        let Some(remaining) = self.time_budget.checked_sub(started.elapsed()) else {
+            return candidate;
+        };
+        let work = self.work_budget.saturating_sub(candidate.total_steps);
+        if work == 0 {
+            return candidate;
+        }
+        let retry = Self {
+            pe: self.pe,
+            stack_base: self.stack_base,
+            step_budget: self.step_budget,
+            block_budget: self.block_budget,
+            time_budget: remaining,
+            work_budget: work,
+            verbose: self.verbose,
+            vm_section: self.vm_section.clone(),
+            retry_deadline: Some(crate::ir::lift::RecoveryDeadline::starting_now(remaining)),
+        };
+        let mut accepted = false;
+        let fallback = crate::vm::diag::attempt(
+            || expr::conservative_recovery(|| retry.recover_configured(start)),
+            |fallback| {
+                accepted = prefer_conservative(&candidate, fallback);
+                accepted
+            },
+        );
+        if self.verbose {
+            eprintln!("[recovery-retry] conservative accepted={accepted}");
+        }
+        if accepted { fallback } else { candidate }
+    }
+
+    fn recover_configured(&self, start: u64) -> Cfg {
         // Derive the VIP slot offset once, here, and use the same answer for both
         // passes. Block identity is `(handler, vip)`, so an offset that differed
         // between passes would leave the second unable to find the joins the first
@@ -370,7 +414,7 @@ impl<'a> Explorer<'a> {
             let mut probe = Emulator::with_vm_section(self.pe, self.stack_base, &self.vm_section);
             probe.discover_vip_slot(start, Self::VIP_PROBE_STEPS)
         };
-        let replay_clock = std::time::Instant::now();
+        let replay_clock = crate::ir::lift::RecoveryDeadline::starting_now(self.time_budget);
         let first = self.recover_pass(start, &HashSet::new(), vip_slot);
         let joins: HashSet<BlockId> = first
             .blocks
@@ -411,6 +455,7 @@ impl<'a> Explorer<'a> {
                     work_budget: remaining_work,
                     verbose: self.verbose,
                     vm_section: self.vm_section.clone(),
+                    retry_deadline: self.retry_deadline,
                 };
                 let mut replayed = replay_explorer.recover_pass_with(
                     start,
@@ -466,7 +511,7 @@ impl<'a> Explorer<'a> {
         };
         // Long-lived arena for the recovered CFG. Blocks graft into this as they
         // are finalized.
-        let mut arena = Arena::default();
+        let mut arena = Arena::for_recovered_cfg();
         let mut blocks: Vec<Block> = Vec::new();
         let mut visited: HashSet<BlockId> = HashSet::new();
         let mut edges: Vec<(BlockId, BlockId)> = Vec::new();
@@ -479,7 +524,7 @@ impl<'a> Explorer<'a> {
         // them. Both checks have to measure the same thing: the between-block check
         // explains why exploration stopped, and the in-block one only decides how far
         // past the deadline a single block is allowed to run before it admits it.
-        let deadline = crate::ir::lift::RecoveryDeadline::starting_now(self.time_budget);
+        let deadline = self.retry_deadline.unwrap_or_else(||crate::ir::lift::RecoveryDeadline::starting_now(self.time_budget));
 
         let mut queue: Vec<Task> = vec![Task {
             emu: {
@@ -2352,6 +2397,22 @@ mod join_replay_tests {
         }
     }
     #[test]
+    fn retry_selection_prefers_validity_over_zero_unresolved() {
+        let mut broken=graph();let good=graph();
+        let foreign=broken.arena.param(expr::BlockRef(99),Reg::Rax);
+        broken.blocks[3].terminator=Terminator::Return {dest:foreign};
+        assert!(!validate(&broken).is_clean());
+        assert!(prefer_conservative(&broken,&good));
+        assert!(!prefer_conservative(&good,&broken));
+        assert!(!prefer_conservative(&good,&good));
+        let mut partial=graph();partial.unresolved=1;
+        partial.blocks[3].terminator=Terminator::Unresolved {reason:"missing target".into()};
+        assert!(prefer_conservative(&partial,&good));
+        assert!(!prefer_conservative(&good,&partial));
+        let mut timed=graph();timed.timed_out=true;
+        assert!(!prefer_conservative(&broken,&timed));
+    }
+    #[test]
     fn replay_audit_rejects_a_conflicting_edge_even_when_the_join_was_specialized() {
         let original = graph();
         let facts = join_constant_proposals(&original);
@@ -2500,4 +2561,12 @@ fn join_replay_is_valid(original: &Cfg, replayed: &Cfg, facts: &JoinConstants) -
         }
     }
     validate(replayed).is_clean()
+}
+
+/// A clean complete result never loses to a speculative retry. Invalid graphs
+/// cannot win merely because they report fewer unresolved blocks.
+fn prefer_conservative(candidate: &Cfg, fallback: &Cfg) -> bool {
+    !fallback.timed_out
+        && validate(fallback).is_clean()
+        && (!validate(candidate).is_clean() || fallback.unresolved == 0 && candidate.unresolved > 0)
 }

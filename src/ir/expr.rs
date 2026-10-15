@@ -340,6 +340,7 @@ pub struct Arena {
     last_compaction_max_depth: usize,
     /// Opt-in comparison rules with measured recovery gains and structural trade-offs.
     extended_comparisons: bool,
+    disable_xor_difference: bool,
     boolean_certificates: HashMap<Ref, Option<u64>>,
     boolean_certificate_mode: bool,
 }
@@ -364,6 +365,7 @@ impl Clone for Arena {
             trunc_depth: self.trunc_depth,
             last_compaction_max_depth: 0,
             extended_comparisons: self.extended_comparisons,
+            disable_xor_difference: self.disable_xor_difference,
             boolean_certificates: HashMap::new(),
             boolean_certificate_mode: self.boolean_certificate_mode,
         }
@@ -387,11 +389,40 @@ fn bitwise_switch_is_on(value: Option<&str>) -> bool {
 }
 
 
+thread_local! {
+    static CONSERVATIVE_RECOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Disable optional algebraic shape changes for one recovery attempt only.
+/// Correctness fixes (including forced-bit XOR and byte extraction) stay active.
+pub(crate) fn conservative_recovery<T>(run: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CONSERVATIVE_RECOVERY.with(|mode| mode.set(self.0));
+        }
+    }
+    let _reset = Reset(CONSERVATIVE_RECOVERY.with(|mode| mode.replace(true)));
+    run()
+}
+pub(crate) fn advanced_recovery_enabled()->bool {
+    ["TVM_EXTENDED_COMPARISONS","TVM_BOOLEAN_CERTIFICATES"].iter().any(|name|
+        bitwise_switch_is_on(std::env::var(name).ok().as_deref()))
+}
+
 impl Arena {
     pub fn new() -> Self {
-        Self { extended_comparisons: bitwise_switch_is_on(std::env::var("TVM_EXTENDED_COMPARISONS").ok().as_deref()),
-            boolean_certificate_mode: bitwise_switch_is_on(std::env::var("TVM_BOOLEAN_CERTIFICATES").ok().as_deref()),
+        let conservative=CONSERVATIVE_RECOVERY.with(|mode|mode.get());
+        Self { disable_xor_difference:conservative,
+            extended_comparisons: !conservative && bitwise_switch_is_on(std::env::var("TVM_EXTENDED_COMPARISONS").ok().as_deref()),
+            boolean_certificate_mode: !conservative && bitwise_switch_is_on(std::env::var("TVM_BOOLEAN_CERTIFICATES").ok().as_deref()),
             ..Self::default() }
+    }
+
+    /// CFG grafting keeps its historical feature configuration, except that a
+    /// conservative retry must not reintroduce the optional XOR difference rule.
+    pub(crate) fn for_recovered_cfg()->Self {
+        Self {disable_xor_difference:CONSERVATIVE_RECOVERY.with(|mode|mode.get()),..Self::default()}
     }
 
     /// How the arena is distributed, for diagnosing runaway growth.
@@ -1380,7 +1411,7 @@ impl Arena {
                 // negates the result. Require equal widths, not register names.
                 for (base, toggled, reverse) in [(a, b, false), (b, a, true)] {
                     if let Some((BinOp::Xor, x, kref)) = self.as_bin(toggled) {
-                        if x == base && self.width(base) == width && self.width(toggled) == width {
+                        if !self.disable_xor_difference && x == base && self.width(base) == width && self.width(toggled) == width {
                             if let Some(k) = self.as_const(kref) {
                                 let one = self.known_one(base);
                                 let zero = self.known_zero(base);
@@ -2887,6 +2918,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn conservative_recovery_retains_correctness_but_skips_optional_shape_changes() {
+        let build=|| {
+            let mut a=Arena::new();let x=a.init_reg(Reg::Rcx);
+            let k=a.constant(0x46,Width::W64);let p=a.bin(BinOp::Or,x,k);
+            let toggle=a.constant(0x40,Width::W64);
+            let q=a.intern(Node {op:Op::Bin(BinOp::Xor,p,toggle),width:Width::W64});
+            let delta=a.bin(BinOp::Sub,p,q);
+            a.as_const(delta)
+        };
+        assert_eq!(build(),Some(0x40));
+        conservative_recovery(|| {
+            assert!(Arena::for_recovered_cfg().disable_xor_difference);
+            assert!(Arena::new().clone().disable_xor_difference);
+            assert!(!Arena::new().extended_comparisons);
+            assert!(!Arena::new().boolean_certificate_mode);
+            assert_eq!(build(),None);
+            let mut a=Arena::new();let x=a.init_reg(Reg::Rcx);
+            let c=a.constant(0x40,Width::W64);let p=a.bin(BinOp::Or,x,c);
+            let t=a.constant(0x60,Width::W64);let fixed=a.bin(BinOp::Xor,p,t);
+            for value in [0,0x20,0x40,0x60,u64::MAX] {
+                assert_eq!(eval(&a,fixed,&HashMap::from([(Reg::Rcx,value)])),(value|0x40)^0x60);
+            }
+        });
+        assert_eq!(build(),Some(0x40));
+    }
+    #[test]
+    fn conservative_profile_is_thread_local_and_restored_after_unwind() {
+        assert!(!Arena::new().disable_xor_difference);
+        let caught=std::panic::catch_unwind(||conservative_recovery(|| {
+            assert!(Arena::new().disable_xor_difference);
+            let other=std::thread::spawn(||Arena::new().disable_xor_difference).join().unwrap();
+            assert!(!other);
+            panic!("exercise profile rollback");
+        }));
+        assert!(caught.is_err());assert!(!Arena::new().disable_xor_difference);
+    }
     #[test]
     fn xor_difference_cancels_known_flag_bits() {
         for w in [Width::W8, Width::W16, Width::W32, Width::W64] {

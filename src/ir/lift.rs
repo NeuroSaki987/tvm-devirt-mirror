@@ -417,6 +417,7 @@ pub struct RecoveryDeadline {
     pub started: std::time::Instant,
     /// Time the pass is allowed.
     pub budget: std::time::Duration,
+    excluded_at_start: std::time::Duration,
 }
 
 impl RecoveryDeadline {
@@ -425,6 +426,7 @@ impl RecoveryDeadline {
         Self {
             started: std::time::Instant::now(),
             budget,
+            excluded_at_start: crate::vm::diag::total_excluded_time(),
         }
     }
 
@@ -437,7 +439,7 @@ impl RecoveryDeadline {
     pub fn elapsed(&self) -> std::time::Duration {
         self.started
             .elapsed()
-            .saturating_sub(crate::vm::diag::excluded_time())
+            .saturating_sub(crate::vm::diag::total_excluded_time().saturating_sub(self.excluded_at_start))
     }
 
     pub fn expired(&self) -> bool {

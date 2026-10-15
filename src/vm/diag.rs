@@ -178,6 +178,7 @@ struct Ctx {
     entry: u64,
     pass: u32,
     excluded_time: std::time::Duration,
+    total_excluded_time: std::time::Duration,
 }
 
 thread_local! {
@@ -194,6 +195,7 @@ pub fn begin(entry: u64) {
             entry,
             pass: 0,
             excluded_time: std::time::Duration::ZERO,
+            total_excluded_time: std::time::Duration::ZERO,
         }
     });
     SINK.with(|s| {
@@ -227,11 +229,13 @@ pub fn measure<T>(f: impl FnOnce() -> T) -> T {
         let mut c = c.borrow_mut();
         if c.on {
             c.excluded_time += elapsed;
+            c.total_excluded_time += elapsed;
         }
     });
     value
 }
 
+#[cfg(test)]
 pub fn excluded_time() -> std::time::Duration {
     CTX.with(|c| {
         let c = c.borrow();
@@ -337,4 +341,97 @@ pub fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Isolate a speculative recovery's records. Rejecting it restores both the
+/// previous final-pass context and its sink, without cloning large DAG reports.
+pub(crate) fn attempt<T>(run: impl FnOnce() -> T, accept: impl FnOnce(&T) -> bool) -> T {
+    struct Restore {
+        ctx: Ctx,
+        sink: Option<Sink>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(sink) = self.sink.take() {
+                SINK.with(|s| *s.borrow_mut() = sink);
+                CTX.with(|c| *c.borrow_mut() = self.ctx);
+            }
+        }
+    }
+    let mut restore = Restore {
+        ctx: CTX.with(|c| *c.borrow()),
+        sink: Some(SINK.with(|s| std::mem::take(&mut *s.borrow_mut()))),
+    };
+    let result = run();
+    if accept(&result) {
+        restore.sink = None;
+    }
+    result
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    #[test]
+    fn rejected_attempt_cannot_replace_the_returned_graphs_diagnostics() {
+        begin(7);
+        set_pass(2);
+        record_stop(StopDiag {
+            handler: 10,
+            ..Default::default()
+        });
+        attempt(
+            || {
+                set_pass(1);
+                record_stop(StopDiag {
+                    handler: 20,
+                    ..Default::default()
+                });
+            },
+            |_| false,
+        );
+        let kept = take();
+        assert_eq!(kept.final_pass, 2);
+        assert_eq!(kept.stops.len(), 1);
+        assert_eq!(kept.stops[0].handler, 10);
+        begin(7);
+        set_pass(2);
+        record_stop(StopDiag {
+            handler: 10,
+            ..Default::default()
+        });
+        attempt(
+            || {
+                set_pass(1);
+                record_stop(StopDiag {
+                    handler: 20,
+                    ..Default::default()
+                });
+            },
+            |_| true,
+        );
+        let kept = take();
+        assert_eq!(kept.final_pass, 1);
+        assert_eq!(kept.stops.len(), 1);
+        assert_eq!(kept.stops[0].handler, 20);
+    }
+}
+
+pub(crate) fn total_excluded_time()->std::time::Duration {
+    CTX.with(|c| {let c=c.borrow();if c.on {c.total_excluded_time} else {std::time::Duration::ZERO}})
+}
+
+#[cfg(test)]
+mod diagnostic_clock_tests {
+    use super::*;
+    #[test]
+    fn recovery_clock_retains_diagnostic_credit_across_passes() {
+        begin(1);set_pass(1);
+        measure(||std::thread::sleep(std::time::Duration::from_millis(1)));
+        let credit=excluded_time();assert!(!credit.is_zero());
+        assert_eq!(total_excluded_time(),credit);
+        set_pass(2);
+        assert_eq!(total_excluded_time(),credit);
+        take();
+    }
 }

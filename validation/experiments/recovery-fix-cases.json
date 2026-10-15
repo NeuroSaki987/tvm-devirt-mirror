@@ -1,0 +1,370 @@
+{
+  "date": "2026-10-15",
+  "scope": "Targeted regression validation, not a new full census",
+  "cases": [
+    {
+      "case": "ACE-Base64",
+      "entry": "0x1811ed5d0",
+      "mode": "default",
+      "counts": [
+        85,
+        8,
+        262880
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 9.5
+    },
+    {
+      "case": "ACE-Base64",
+      "entry": "0x1811ed5d0",
+      "mode": "optin",
+      "counts": [
+        85,
+        8,
+        262880
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 6.26
+    },
+    {
+      "case": "ACE-DFS64-s2",
+      "entry": "0x180026bb0",
+      "mode": "default",
+      "counts": [
+        61,
+        1,
+        41715
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 1.14
+    },
+    {
+      "case": "ACE-DFS64-s2",
+      "entry": "0x180026bb0",
+      "mode": "optin",
+      "counts": [
+        61,
+        1,
+        41715
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 2.58
+    },
+    {
+      "case": "ACE-DFS64-s2",
+      "entry": "0x1800560d0",
+      "mode": "default",
+      "counts": [
+        64,
+        1,
+        154967
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 8.09
+    },
+    {
+      "case": "ACE-DFS64-s2",
+      "entry": "0x1800560d0",
+      "mode": "optin",
+      "counts": [
+        64,
+        1,
+        154967
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 6.37
+    },
+    {
+      "case": "SGuard64",
+      "entry": "0x140057550",
+      "mode": "default",
+      "counts": [
+        60,
+        0,
+        108046
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 1.29
+    },
+    {
+      "case": "SGuard64",
+      "entry": "0x140057550",
+      "mode": "optin",
+      "counts": [
+        60,
+        0,
+        108046
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 1.18
+    },
+    {
+      "case": "core1",
+      "entry": "0x140020150",
+      "mode": "default",
+      "counts": [
+        81,
+        0,
+        196743
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 8.54
+    },
+    {
+      "case": "core1",
+      "entry": "0x140020150",
+      "mode": "optin",
+      "counts": [
+        81,
+        0,
+        196743
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 13.53
+    },
+    {
+      "case": "dfs64-s1",
+      "entry": "0x180087650",
+      "mode": "default",
+      "counts": [
+        40,
+        0,
+        173252
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 4.81
+    },
+    {
+      "case": "dfs64-s1",
+      "entry": "0x180087650",
+      "mode": "optin",
+      "counts": [
+        40,
+        0,
+        173252
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 8.52
+    },
+    {
+      "case": "ACE-Base64",
+      "entry": "0x18034ec50",
+      "mode": "default",
+      "counts": [
+        31,
+        0,
+        248049
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 1.14
+    },
+    {
+      "case": "ACE-Base64",
+      "entry": "0x18034ec50",
+      "mode": "optin",
+      "counts": [
+        31,
+        0,
+        248049
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 2.18
+    },
+    {
+      "case": "ssc64",
+      "entry": "0x1800f64e0",
+      "mode": "default",
+      "counts": [
+        45,
+        0,
+        284294
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 2.97
+    },
+    {
+      "case": "ssc64",
+      "entry": "0x1800f64e0",
+      "mode": "optin",
+      "counts": [
+        45,
+        0,
+        284294
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 5.94
+    },
+    {
+      "case": "SGuard64",
+      "entry": "0x14002bd60",
+      "mode": "default",
+      "counts": [
+        57,
+        0,
+        185916
+      ],
+      "clean": false,
+      "issue_summary": "nondominating_params 1969",
+      "timed_out": false,
+      "seconds": 5.04
+    },
+    {
+      "case": "SGuard64",
+      "entry": "0x14002bd60",
+      "mode": "optin",
+      "counts": [
+        51,
+        0,
+        171926
+      ],
+      "clean": false,
+      "issue_summary": "nondominating_params 1849",
+      "timed_out": false,
+      "seconds": 6.2
+    },
+    {
+      "case": "SGuard64",
+      "entry": "0x1400526f0",
+      "mode": "default",
+      "counts": [
+        17,
+        0,
+        71339
+      ],
+      "clean": false,
+      "issue_summary": "nondominating_params 786",
+      "timed_out": false,
+      "seconds": 0.96
+    },
+    {
+      "case": "SGuard64",
+      "entry": "0x1400526f0",
+      "mode": "optin",
+      "counts": [
+        15,
+        0,
+        65831
+      ],
+      "clean": false,
+      "issue_summary": "nondominating_params 618",
+      "timed_out": false,
+      "seconds": 1.25
+    },
+    {
+      "case": "SGuard64",
+      "entry": "0x140052a30",
+      "mode": "default",
+      "counts": [
+        60,
+        1,
+        127791
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 5.11
+    },
+    {
+      "case": "SGuard64",
+      "entry": "0x140052a30",
+      "mode": "optin",
+      "counts": [
+        39,
+        0,
+        119875
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 1.56
+    },
+    {
+      "case": "SGuard64",
+      "entry": "0x140098f90",
+      "mode": "default",
+      "counts": [
+        34,
+        1,
+        70061
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 1.87
+    },
+    {
+      "case": "SGuard64",
+      "entry": "0x140098f90",
+      "mode": "optin",
+      "counts": [
+        29,
+        0,
+        96349
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 1.14
+    },
+    {
+      "case": "SGuard64",
+      "entry": "0x14009ea30",
+      "mode": "default",
+      "counts": [
+        361,
+        1,
+        1166667
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 60.69
+    },
+    {
+      "case": "SGuard64",
+      "entry": "0x14009ea30",
+      "mode": "optin",
+      "counts": [
+        367,
+        0,
+        1259573
+      ],
+      "clean": true,
+      "issue_summary": "clean",
+      "timed_out": false,
+      "seconds": 12.93
+    }
+  ]
+}

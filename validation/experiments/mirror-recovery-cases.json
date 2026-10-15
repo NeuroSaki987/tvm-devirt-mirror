@@ -434,5 +434,6 @@
       },
       "steps_per_block": 2000000
     }
-  ]
+  ],
+  "scope": "Historical PR #4 output counts; zero unresolved does not imply a structurally valid CFG. See regression-fixes report."
 }

@@ -62,7 +62,8 @@ def main() -> int:
     parser.add_argument("--exe", type=Path, default=ROOT / "target/release" / (
         "tvm-devirt.exe" if sys.platform == "win32" else "tvm-devirt"))
     parser.add_argument("--entry", action="append", type=lambda v: hex(int(v, 0)))
-    parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--timeout", type=float, default=300,
+                        help="External process guard (seconds); recovery has two 120-second passes")
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
