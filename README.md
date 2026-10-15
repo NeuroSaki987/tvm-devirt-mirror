@@ -13,6 +13,13 @@
 - [`fix/pseudo-entry-filter`](https://github.com/NeuroSaki987/tvm-devirt-mirror/tree/fix/pseudo-entry-filter)：`entries` 默认过滤有字节证据的填充和伪入口，同时保留仅凭形状可疑的入口。可用 `--include-stubs` 恢复旧口径，或用 `--aggressive-shape-filter` 启用更激进的形状过滤。恢复入口集合保持不变。
 
 
+## 符号计算正确性修正
+
+- **强制位 XOR 化简**：修正 `(A | c1) ^ c2` 合并常数时遗漏掩码的问题，避免将已被 OR 固定的位错误地还原为 A 的原始位。
+- **符号内存高字节读取**：先在源位宽内移位，再缩窄到读取位宽，避免读取 64 位符号值的高字节时因提前截断而丢失数据。
+
+两项修正无需开关。205 项单元测试通过；此前出现回归的 8 个入口，其块数、未解析数、步数和结构校验结果均与修正前基线一致。它们修复计算语义错误，不代表新增了完整恢复入口，也不代表已完成全量等价验证。
+
 ## 相比原项目增加了什么
 
 ```bash
@@ -70,6 +77,8 @@ Two additional changes are integrated into `master`; their original branches rem
 
 - [`feat/configurable-block-budget`](https://github.com/NeuroSaki987/tvm-devirt-mirror/tree/feat/configurable-block-budget) adds configurable block limits and separates budget truncation from rule-level unresolved blocks.
 - [`fix/pseudo-entry-filter`](https://github.com/NeuroSaki987/tvm-devirt-mirror/tree/fix/pseudo-entry-filter) makes the `entries` census conservatively exclude byte-proven stubs without changing recovery discovery.
+
+Two correctness fixes also preserve forced OR bits when simplifying `(A | c1) ^ c2` and extract symbolic memory bytes at the source width before narrowing. Both are always enabled. All 205 unit tests pass, and eight previously problematic entries match the baseline in block counts, unresolved counts, steps, and structural validation. These results do not establish additional fully recovered entries or full semantic equivalence.
 
 The added `unresolved` command reports final unresolved CFG blocks, failed indirect-branch expressions, candidate arms, bounded-index probes, CFG invariant violations, and expression-DAG composition. Diagnostic-only work is excluded from the recovery timeout, and the tool does not discard unproven paths merely to reduce the unresolved count.
 
