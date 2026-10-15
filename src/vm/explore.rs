@@ -336,6 +336,7 @@ pub struct Explorer<'a> {
 
     /// Name of the section holding VM bytecode.
     vm_section: String,
+    retry_deadline: Option<crate::ir::lift::RecoveryDeadline>,
 }
 
 impl<'a> Explorer<'a> {
@@ -349,6 +350,7 @@ impl<'a> Explorer<'a> {
             work_budget: 24_000_000,
             verbose: false,
             vm_section: crate::vm::DEFAULT_VM_SECTION.to_string(),
+            retry_deadline: None,
         }
     }
 
@@ -362,6 +364,48 @@ impl<'a> Explorer<'a> {
 
     /// Recover the CFG of the virtualized function entered at `start`. Runs recovery twice. The first pass discovers the graph shape; the second re-runs it knowing which blocks are joins, and cuts SSA parameters only there.
     pub fn recover(&self, start: u64) -> Cfg {
+        let started = crate::ir::lift::RecoveryDeadline::starting_now(self.time_budget);
+        let candidate = self.recover_configured(start);
+        let clean = validate(&candidate).is_clean();
+        // Clean partial results are normal under the default recovery rules.
+        // Only advanced algebra needs an alternate attempt for lost closure;
+        // an invalid structure always needs one, including in default mode.
+        if clean && (candidate.unresolved == 0 || !expr::advanced_recovery_enabled()) {
+            return candidate;
+        }
+        let Some(remaining) = self.time_budget.checked_sub(started.elapsed()) else {
+            return candidate;
+        };
+        let work = self.work_budget.saturating_sub(candidate.total_steps);
+        if work == 0 {
+            return candidate;
+        }
+        let retry = Self {
+            pe: self.pe,
+            stack_base: self.stack_base,
+            step_budget: self.step_budget,
+            block_budget: self.block_budget,
+            time_budget: remaining,
+            work_budget: work,
+            verbose: self.verbose,
+            vm_section: self.vm_section.clone(),
+            retry_deadline: Some(crate::ir::lift::RecoveryDeadline::starting_now(remaining)),
+        };
+        let mut accepted = false;
+        let fallback = crate::vm::diag::attempt(
+            || expr::conservative_recovery(|| retry.recover_configured(start)),
+            |fallback| {
+                accepted = prefer_conservative(&candidate, fallback);
+                accepted
+            },
+        );
+        if self.verbose {
+            eprintln!("[recovery-retry] conservative accepted={accepted}");
+        }
+        if accepted { fallback } else { candidate }
+    }
+
+    fn recover_configured(&self, start: u64) -> Cfg {
         // Derive the VIP slot offset once, here, and use the same answer for both
         // passes. Block identity is `(handler, vip)`, so an offset that differed
         // between passes would leave the second unable to find the joins the first
@@ -370,6 +414,7 @@ impl<'a> Explorer<'a> {
             let mut probe = Emulator::with_vm_section(self.pe, self.stack_base, &self.vm_section);
             probe.discover_vip_slot(start, Self::VIP_PROBE_STEPS)
         };
+        let replay_clock = crate::ir::lift::RecoveryDeadline::starting_now(self.time_budget);
         let first = self.recover_pass(start, &HashSet::new(), vip_slot);
         let joins: HashSet<BlockId> = first
             .blocks
@@ -380,8 +425,63 @@ impl<'a> Explorer<'a> {
         if joins.is_empty() {
             return first;
         }
-        let mut cfg = self.recover_pass_with(start, &joins, Some(&first), vip_slot);
-        cfg.trivial_phis_removed = cfg.simplify_phis();
+        let mut cfg = self.recover_pass_with(start, &joins, Some(&first), vip_slot, None);
+        let replay_on = std::env::var("TVM_JOIN_CONSTANT_REPLAY")
+            .ok()
+            .is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
+        if replay_on && cfg.unresolved > 0 {
+            let facts = join_constant_proposals(&first);
+            let remaining_time = self.time_budget.checked_sub(replay_clock.elapsed());
+            let remaining_work = self
+                .work_budget
+                .saturating_sub(first.total_steps)
+                .saturating_sub(cfg.total_steps);
+            if !facts.is_empty()
+                && facts.len() <= 1024
+                && remaining_work > 0
+                && let Some(time_budget) = remaining_time
+            {
+                let replay_explorer = Self {
+                    pe: self.pe,
+                    stack_base: self.stack_base,
+                    step_budget: self.step_budget,
+                    block_budget: self.block_budget,
+                    time_budget,
+                    work_budget: remaining_work,
+                    verbose: self.verbose,
+                    vm_section: self.vm_section.clone(),
+                    retry_deadline: self.retry_deadline,
+                };
+                let mut replayed = replay_explorer.recover_pass_with(
+                    start,
+                    &joins,
+                    Some(&first),
+                    vip_slot,
+                    Some(&facts),
+                );
+                replayed.trivial_phis_removed = replayed.simplify_phis();
+                replayed.remove_dead_params();
+                let accepted = join_replay_is_valid(&first, &replayed, &facts);
+                if self.verbose {
+                    eprintln!(
+                        "[join-replay] facts={} unresolved={} accepted={accepted}",
+                        facts.len(),
+                        replayed.unresolved
+                    );
+                }
+                if accepted {
+                    cfg = replayed;
+                } else {
+                    crate::vm::diag::set_pass(2);
+                }
+            }
+        }
+        cfg.trivial_phis_removed += cfg.simplify_phis();
         cfg.remove_dead_params();
         cfg
     }
@@ -389,7 +489,7 @@ impl<'a> Explorer<'a> {
     pub const VIP_PROBE_STEPS: usize = 20_000;
 
     fn recover_pass(&self, start: u64, cut_at: &HashSet<BlockId>, vip_slot: Option<u64>) -> Cfg {
-        self.recover_pass_with(start, cut_at, None, vip_slot)
+        self.recover_pass_with(start, cut_at, None, vip_slot, None)
     }
 
     /// One recovery pass, optionally guided by the structure an earlier pass found. `known` decouples control-flow recovery from data-flow recovery.
@@ -399,18 +499,19 @@ impl<'a> Explorer<'a> {
         cut_at: &HashSet<BlockId>,
         known: Option<&Cfg>,
         vip_slot: Option<u64>,
+        join_constants: Option<&JoinConstants>,
     ) -> Cfg {
         // Pass 2 re-runs recovery with the joins cut and the concrete pass as a guide;
         // the graph it returns is the one callers see, so a failure has to be
         // attributable to the pass that produced it.
-        crate::vm::diag::set_pass(if known.is_some() { 2 } else { 1 });
+        crate::vm::diag::set_pass(if join_constants.is_some() { 3 } else if known.is_some() { 2 } else { 1 });
         let entry_id = BlockId {
             handler: start,
             vip: None,
         };
         // Long-lived arena for the recovered CFG. Blocks graft into this as they
         // are finalized.
-        let mut arena = Arena::default();
+        let mut arena = Arena::for_recovered_cfg();
         let mut blocks: Vec<Block> = Vec::new();
         let mut visited: HashSet<BlockId> = HashSet::new();
         let mut edges: Vec<(BlockId, BlockId)> = Vec::new();
@@ -423,7 +524,7 @@ impl<'a> Explorer<'a> {
         // them. Both checks have to measure the same thing: the between-block check
         // explains why exploration stopped, and the in-block one only decides how far
         // past the deadline a single block is allowed to run before it admits it.
-        let deadline = crate::ir::lift::RecoveryDeadline::starting_now(self.time_budget);
+        let deadline = self.retry_deadline.unwrap_or_else(||crate::ir::lift::RecoveryDeadline::starting_now(self.time_budget));
 
         let mut queue: Vec<Task> = vec![Task {
             emu: {
@@ -508,7 +609,11 @@ impl<'a> Explorer<'a> {
             // Replace the guest register image with this block's SSA parameters before any of its instructions run, so everything the block computes is expressed in terms of its own entry state rather than reaching back to function entry through whichever single path got here.
             let block_ref = expr::BlockRef(blocks.len() as u32);
             let mut entry_params = if cut_at.contains(&task.id) {
-                task.emu.seed_guest_params(block_ref)
+                if let Some(facts)=join_constants {
+                    let constants:HashMap<Reg,u64>=expr::GPRS.into_iter().filter_map(|reg|
+                        facts.get(&(task.id,reg)).map(|&v|(reg,v))).collect();
+                    task.emu.seed_guest_params_with_constants(block_ref,&constants)
+                } else {task.emu.seed_guest_params(block_ref)}
             } else {
                 Vec::new()
             };
@@ -2235,4 +2340,233 @@ mod candidate_tests {
             "candidates contain no provably one-bit value"
         );
     }
+}
+
+#[cfg(test)]
+mod join_replay_tests {
+    use super::*;
+    fn id(h: u64) -> BlockId {
+        BlockId {
+            handler: h,
+            vip: Some(h),
+        }
+    }
+    fn graph() -> Cfg {
+        let mut arena = Arena::new();
+        let c = arena.constant(0x1000, Width::W64);
+        let pred = arena.init_reg(Reg::Rax);
+        let block = |h, preds, term| Block {
+            id: id(h),
+            block_ref: expr::BlockRef(h as u32),
+            params: vec![],
+            events: vec![],
+            from_vm_context: true,
+            exit_regs: vec![(Reg::Rsp, c)],
+            terminator: term,
+            cost: 0,
+            preds,
+        };
+        Cfg {
+            entry: id(0),
+            arena,
+            blocks: vec![
+                block(
+                    0,
+                    vec![],
+                    Terminator::Branch {
+                        predicate: pred,
+                        taken: id(1),
+                        not_taken: id(2),
+                    },
+                ),
+                block(1, vec![id(0)], Terminator::Jump(id(3))),
+                block(2, vec![id(0)], Terminator::Jump(id(3))),
+                block(
+                    3,
+                    vec![id(1), id(2)],
+                    Terminator::TailCall { target: 0x2000 },
+                ),
+            ],
+            total_steps: 0,
+            unresolved: 0,
+            back_edges: vec![],
+            trivial_phis_removed: 0,
+            timed_out: false,
+            stack_base: 0x1000,
+            vm_range: (0, 0),
+        }
+    }
+    #[test]
+    fn retry_selection_prefers_validity_over_zero_unresolved() {
+        let mut broken=graph();let good=graph();
+        let foreign=broken.arena.param(expr::BlockRef(99),Reg::Rax);
+        broken.blocks[3].terminator=Terminator::Return {dest:foreign};
+        assert!(!validate(&broken).is_clean());
+        assert!(prefer_conservative(&broken,&good));
+        assert!(!prefer_conservative(&good,&broken));
+        assert!(!prefer_conservative(&good,&good));
+        let mut partial=graph();partial.unresolved=1;
+        partial.blocks[3].terminator=Terminator::Unresolved {reason:"missing target".into()};
+        assert!(prefer_conservative(&partial,&good));
+        assert!(!prefer_conservative(&good,&partial));
+        let mut timed=graph();timed.timed_out=true;
+        assert!(!prefer_conservative(&broken,&timed));
+    }
+    #[test]
+    fn replay_audit_rejects_a_conflicting_edge_even_when_the_join_was_specialized() {
+        let original = graph();
+        let facts = join_constant_proposals(&original);
+        let mut replayed = graph();
+        assert!(join_replay_is_valid(&original, &replayed, &facts));
+        let different = replayed.arena.constant(0x1008, Width::W64);
+        replayed.blocks[2].exit_regs[0].1 = different;
+        assert!(!join_replay_is_valid(&original, &replayed, &facts));
+        let mut missing = graph();
+        missing.blocks[2].terminator = Terminator::TailCall { target: 0x2000 };
+        assert!(!join_replay_is_valid(&original, &missing, &facts));
+        let mut incomplete = graph();
+        incomplete.blocks[2].terminator = Terminator::Unresolved {
+            reason: "cannot prove transfer".into(),
+        };
+        assert!(!join_replay_is_valid(&original, &incomplete, &facts));
+        assert!(join_constant_proposals(&incomplete).is_empty());
+        let mut swapped = graph();
+        if let Terminator::Branch {
+            taken, not_taken, ..
+        } = &mut swapped.blocks[0].terminator
+        {
+            std::mem::swap(taken, not_taken);
+        }
+        assert!(!join_replay_is_valid(&original, &swapped, &facts));
+        let mut other_exit = graph();
+        other_exit.blocks[3].terminator = Terminator::TailCall { target: 0x3000 };
+        assert!(!join_replay_is_valid(&original, &other_exit, &facts));
+    }
+    #[test]
+    fn join_proposals_require_every_predecessor_to_supply_the_same_constant() {
+        let mut g = graph();
+        assert_eq!(
+            join_constant_proposals(&g).get(&(id(3), Reg::Rsp)),
+            Some(&0x1000)
+        );
+        let other = g.arena.constant(0x1008, Width::W64);
+        g.blocks[2].exit_regs[0].1 = other;
+        assert!(join_constant_proposals(&g).is_empty());
+        g.blocks[2].exit_regs.clear();
+        assert!(join_constant_proposals(&g).is_empty());
+        g.blocks[3].preds.push(id(99));
+        assert!(join_constant_proposals(&g).is_empty());
+    }
+}
+type JoinConstants = HashMap<(BlockId, Reg), u64>;
+
+// Candidates are derived from every incoming edge, never the first-arriving
+// state. They become usable facts only after a complete replay is validated.
+fn join_constant_proposals(cfg: &Cfg) -> JoinConstants {
+    let mut out = HashMap::new();
+    if cfg.timed_out
+        || cfg.unresolved != 0
+        || cfg.blocks.iter().any(|b| {
+            matches!(
+                b.terminator,
+                Terminator::Unresolved { .. }
+                    | Terminator::Adopted { .. }
+                    | Terminator::AdoptedSwitch { .. }
+                    | Terminator::AdoptedReturn
+            )
+        })
+    {
+        return out;
+    }
+    for b in &cfg.blocks {
+        if b.id == cfg.entry || !b.from_vm_context || b.preds.len() < 2 {
+            continue;
+        }
+        for reg in expr::GPRS {
+            let mut common = None;
+            let mut all = true;
+            for pred in &b.preds {
+                let value = cfg
+                    .block(*pred)
+                    .filter(|p| p.from_vm_context)
+                    .and_then(|p| p.exit_regs.iter().find(|(r, _)| *r == reg))
+                    .and_then(|(_, v)| cfg.arena.as_const(*v));
+                let Some(value) = value else {
+                    all = false;
+                    break;
+                };
+                if common.is_some_and(|k| k != value) {
+                    all = false;
+                    break;
+                }
+                common = Some(value);
+            }
+            if all && let Some(value) = common {
+                out.insert((b.id, reg), value);
+            }
+        }
+    }
+    out
+}
+
+fn join_replay_is_valid(original: &Cfg, replayed: &Cfg, facts: &JoinConstants) -> bool {
+    if original.entry != replayed.entry
+        || original.blocks.len() != replayed.blocks.len()
+        || replayed.timed_out
+        || replayed.unresolved != 0
+    {
+        return false;
+    }
+    for b in &original.blocks {
+        let Some(other) = replayed.block(b.id) else {
+            return false;
+        };
+        if matches!(
+            other.terminator,
+            Terminator::Unresolved { .. }
+                | Terminator::Adopted { .. }
+                | Terminator::AdoptedSwitch { .. }
+                | Terminator::AdoptedReturn
+        ) {
+            return false;
+        }
+        if std::mem::discriminant(&b.terminator) != std::mem::discriminant(&other.terminator)
+            || Cfg::successors(b) != Cfg::successors(other)
+        {
+            return false;
+        }
+        if let (Terminator::TailCall { target: expected }, Terminator::TailCall { target: actual }) =
+            (&b.terminator, &other.terminator)
+            && expected != actual
+        {
+            return false;
+        }
+    }
+    for (&(block, reg), &expected) in facts {
+        let Some(b) = original.block(block) else {
+            return false;
+        };
+        if b.id == original.entry || b.preds.is_empty() {
+            return false;
+        }
+        for pred in &b.preds {
+            let actual = replayed
+                .block(*pred)
+                .filter(|p| p.from_vm_context)
+                .and_then(|p| p.exit_regs.iter().find(|(r, _)| *r == reg))
+                .and_then(|(_, v)| replayed.arena.as_const(*v));
+            if actual != Some(expected) {
+                return false;
+            }
+        }
+    }
+    validate(replayed).is_clean()
+}
+
+/// A clean complete result never loses to a speculative retry. Invalid graphs
+/// cannot win merely because they report fewer unresolved blocks.
+fn prefer_conservative(candidate: &Cfg, fallback: &Cfg) -> bool {
+    !fallback.timed_out
+        && validate(fallback).is_clean()
+        && (!validate(candidate).is_clean() || fallback.unresolved == 0 && candidate.unresolved > 0)
 }

@@ -417,6 +417,7 @@ pub struct RecoveryDeadline {
     pub started: std::time::Instant,
     /// Time the pass is allowed.
     pub budget: std::time::Duration,
+    excluded_at_start: std::time::Duration,
 }
 
 impl RecoveryDeadline {
@@ -425,6 +426,7 @@ impl RecoveryDeadline {
         Self {
             started: std::time::Instant::now(),
             budget,
+            excluded_at_start: crate::vm::diag::total_excluded_time(),
         }
     }
 
@@ -437,7 +439,7 @@ impl RecoveryDeadline {
     pub fn elapsed(&self) -> std::time::Duration {
         self.started
             .elapsed()
-            .saturating_sub(crate::vm::diag::excluded_time())
+            .saturating_sub(crate::vm::diag::total_excluded_time().saturating_sub(self.excluded_at_start))
     }
 
     pub fn expired(&self) -> bool {
@@ -815,6 +817,16 @@ impl<'a> Emulator<'a> {
     /// then inherit the assertion and compute with it, which is how a fork ends up
     /// dispatching to an address the VM never reaches.
     pub fn seed_guest_params(&mut self, block: crate::ir::expr::BlockRef) -> Vec<(Reg, Ref)> {
+        self.seed_guest_params_with_constants(block, &HashMap::new())
+    }
+
+    /// Speculative join invariants. The Explorer must validate every incoming
+    /// edge after replay before exposing a CFG constructed with these values.
+    pub(crate) fn seed_guest_params_with_constants(
+        &mut self,
+        block: crate::ir::expr::BlockRef,
+        constants: &HashMap<Reg, u64>,
+    ) -> Vec<(Reg, Ref)> {
         let Some(base) = self.locate_guest_context() else {
             return Vec::new();
         };
@@ -822,9 +834,15 @@ impl<'a> Emulator<'a> {
         let layout = self.guest_layout.unwrap_or(LAYOUTS[0]);
         for (i, reg) in layout.order.iter().enumerate() {
             let addr = base.wrapping_add(layout.first_reg + i as u64 * 8);
-            let p = self.arena.param(block, *reg);
-            self.state.store_concrete(&self.arena, addr, p, Width::W64);
-            out.push((*reg, p));
+            let value = if let Some(&k) = constants.get(reg) {
+                self.arena.constant(k, Width::W64)
+            } else {
+                let p = self.arena.param(block, *reg);
+                out.push((*reg, p));
+                p
+            };
+            self.state
+                .store_concrete(&self.arena, addr, value, Width::W64);
         }
         out
     }

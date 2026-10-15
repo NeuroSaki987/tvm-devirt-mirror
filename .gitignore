@@ -12,3 +12,6 @@
 *.id2
 *.nam
 *.til
+
+# Python validation caches
+__pycache__/

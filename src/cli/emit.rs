@@ -163,11 +163,7 @@ pub fn cmd_devirt(
     // Raising the budget enlarges the graph, and a larger graph is where the SSA
     // scoping rule is most likely to break. Report it here rather than only in
     // write-devirt, so a single-function sweep can see it.
-    let issues = explore::validate(&cfg);
-    if !issues.is_clean() {
-        println!("cfg issues: {}", issues.summary());
-    }
-
+    require_valid_structure(&cfg)?;
     let sched_blocks = sched::schedule(&cfg);
     let allocs: Vec<regalloc::Alloc> = sched_blocks.iter().map(regalloc::allocate).collect();
 
@@ -202,4 +198,58 @@ pub fn cmd_devirt(
         }
     }
     Ok(())
+}
+
+fn require_valid_structure(cfg: &crate::ir::Cfg) -> Result<()> {
+    let issues = explore::validate(cfg);
+    anyhow::ensure!(
+        issues.is_clean(),
+        "refusing to emit invalid CFG: {}",
+        issues.summary()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod structure_tests {
+    use super::*;
+    use crate::ir::{
+        Block, BlockId, Cfg, Terminator,
+        expr::{Arena, BlockRef, Reg},
+    };
+    #[test]
+    fn zero_unresolved_does_not_authorize_emitting_an_out_of_scope_parameter() {
+        let mut arena = Arena::new();
+        let invalid = arena.param(BlockRef(99), Reg::Rax);
+        let id = BlockId {
+            handler: 0x1000,
+            vip: None,
+        };
+        let mut cfg = Cfg {
+            entry: id,
+            arena,
+            blocks: vec![Block {
+                id,
+                block_ref: BlockRef(0),
+                params: vec![],
+                events: vec![],
+                from_vm_context: false,
+                exit_regs: vec![],
+                terminator: Terminator::Return { dest: invalid },
+                cost: 0,
+                preds: vec![],
+            }],
+            total_steps: 0,
+            unresolved: 0,
+            back_edges: vec![],
+            trivial_phis_removed: 0,
+            timed_out: false,
+            stack_base: 0x10000,
+            vm_range: (0, 0),
+        };
+        assert!(require_valid_structure(&cfg).is_err());
+        let valid = cfg.arena.init_reg(Reg::Rax);
+        cfg.blocks[0].terminator = Terminator::Return { dest: valid };
+        assert!(require_valid_structure(&cfg).is_ok());
+    }
 }

@@ -1,0 +1,439 @@
+{
+  "base_commit": "562f769",
+  "date": "2026-10-15",
+  "cases": [
+    {
+      "case": "service",
+      "sample": "ACE-Service64.exe",
+      "entry": "0x1400059f0",
+      "master": {
+        "exit": 0,
+        "seconds": 1.006,
+        "counts": [
+          8,
+          0,
+          316
+        ],
+        "emitted_bytes": 559
+      },
+      "default": {
+        "exit": 0,
+        "seconds": 0.788,
+        "counts": [
+          8,
+          0,
+          316
+        ],
+        "emitted_bytes": 559
+      },
+      "opt-in": {
+        "exit": 0,
+        "seconds": 0.018,
+        "counts": [
+          8,
+          0,
+          316
+        ],
+        "emitted_bytes": 559
+      },
+      "steps_per_block": 400000
+    },
+    {
+      "case": "csi",
+      "sample": "ACE-CSI64-s2.dll",
+      "entry": "0x18006cee0",
+      "master": {
+        "exit": 0,
+        "seconds": 0.367,
+        "counts": [
+          25,
+          0,
+          175389
+        ],
+        "emitted_bytes": 5453
+      },
+      "default": {
+        "exit": 0,
+        "seconds": 0.392,
+        "counts": [
+          25,
+          0,
+          175389
+        ],
+        "emitted_bytes": 5453
+      },
+      "opt-in": {
+        "exit": 0,
+        "seconds": 0.45,
+        "counts": [
+          25,
+          0,
+          175389
+        ],
+        "emitted_bytes": 5421
+      },
+      "steps_per_block": 400000
+    },
+    {
+      "case": "agent",
+      "sample": "SGuardAgent64.dll",
+      "entry": "0x18000c0e0",
+      "master": {
+        "exit": 0,
+        "seconds": 0.961,
+        "counts": [
+          57,
+          0,
+          228460
+        ],
+        "emitted_bytes": 5157
+      },
+      "default": {
+        "exit": 0,
+        "seconds": 0.952,
+        "counts": [
+          57,
+          0,
+          228460
+        ],
+        "emitted_bytes": 5157
+      },
+      "opt-in": {
+        "exit": 0,
+        "seconds": 1.591,
+        "counts": [
+          57,
+          0,
+          228460
+        ],
+        "emitted_bytes": 5157
+      },
+      "steps_per_block": 400000
+    },
+    {
+      "case": "sg-af280",
+      "sample": "SGuard64.exe",
+      "entry": "0x1400af280",
+      "master": {
+        "exit": 0,
+        "seconds": 0.493,
+        "counts": [
+          7,
+          1,
+          436855
+        ],
+        "emitted_bytes": 958
+      },
+      "default": {
+        "exit": 0,
+        "seconds": 0.489,
+        "counts": [
+          7,
+          1,
+          436855
+        ],
+        "emitted_bytes": 958
+      },
+      "opt-in": {
+        "exit": 0,
+        "seconds": 0.54,
+        "counts": [
+          7,
+          1,
+          436855
+        ],
+        "emitted_bytes": 862
+      },
+      "steps_per_block": 400000
+    },
+    {
+      "case": "sg-526f0",
+      "sample": "SGuard64.exe",
+      "entry": "0x1400526f0",
+      "master": {
+        "exit": 0,
+        "seconds": 0.505,
+        "counts": [
+          41,
+          3,
+          57257
+        ],
+        "emitted_bytes": 17537
+      },
+      "default": {
+        "exit": 0,
+        "seconds": 0.403,
+        "counts": [
+          17,
+          0,
+          71339
+        ],
+        "emitted_bytes": 4270
+      },
+      "opt-in": {
+        "exit": 0,
+        "seconds": 0.312,
+        "counts": [
+          15,
+          0,
+          65831
+        ],
+        "emitted_bytes": 3023
+      },
+      "steps_per_block": 400000
+    },
+    {
+      "case": "sg-2bd60",
+      "sample": "SGuard64.exe",
+      "entry": "0x14002bd60",
+      "master": {
+        "exit": 0,
+        "seconds": 2.131,
+        "counts": [
+          85,
+          4,
+          161894
+        ],
+        "emitted_bytes": 35308
+      },
+      "default": {
+        "exit": 0,
+        "seconds": 1.977,
+        "counts": [
+          57,
+          0,
+          185916
+        ],
+        "emitted_bytes": 29789
+      },
+      "opt-in": {
+        "exit": 0,
+        "seconds": 1.825,
+        "counts": [
+          51,
+          0,
+          171926
+        ],
+        "emitted_bytes": 26556
+      },
+      "steps_per_block": 400000
+    },
+    {
+      "case": "sg-b1250",
+      "sample": "SGuard64.exe",
+      "entry": "0x1400b1250",
+      "master": {
+        "exit": 0,
+        "seconds": 0.242,
+        "counts": [
+          19,
+          0,
+          111956
+        ],
+        "emitted_bytes": 4706
+      },
+      "default": {
+        "exit": 0,
+        "seconds": 0.249,
+        "counts": [
+          19,
+          0,
+          111956
+        ],
+        "emitted_bytes": 4706
+      },
+      "opt-in": {
+        "exit": 0,
+        "seconds": 0.182,
+        "counts": [
+          11,
+          0,
+          82892
+        ],
+        "emitted_bytes": 2528
+      },
+      "steps_per_block": 400000
+    },
+    {
+      "case": "core-control",
+      "sample": "ACE-CORE302706.sys",
+      "entry": "0x14004590c",
+      "master": {
+        "exit": 0,
+        "seconds": 0.071,
+        "counts": [
+          7,
+          0,
+          30896
+        ],
+        "emitted_bytes": 271
+      },
+      "default": {
+        "exit": 0,
+        "seconds": 0.074,
+        "counts": [
+          7,
+          0,
+          30896
+        ],
+        "emitted_bytes": 271
+      },
+      "opt-in": {
+        "exit": 0,
+        "seconds": 0.214,
+        "counts": [
+          7,
+          0,
+          30896
+        ],
+        "emitted_bytes": 271
+      },
+      "steps_per_block": 400000
+    },
+    {
+      "case": "sg-52a30",
+      "sample": "SGuard64.exe",
+      "entry": "0x140052a30",
+      "master": {
+        "exit": 0,
+        "seconds": 2.065,
+        "counts": [
+          60,
+          1,
+          127791
+        ],
+        "emitted_bytes": 5561
+      },
+      "default": {
+        "exit": 0,
+        "seconds": 2.079,
+        "counts": [
+          60,
+          1,
+          127791
+        ],
+        "emitted_bytes": 5561
+      },
+      "opt-in": {
+        "exit": 0,
+        "seconds": 1.281,
+        "counts": [
+          39,
+          0,
+          119875
+        ],
+        "emitted_bytes": 2396
+      },
+      "steps_per_block": 400000
+    },
+    {
+      "case": "sg-98f90",
+      "sample": "SGuard64.exe",
+      "entry": "0x140098f90",
+      "master": {
+        "exit": 0,
+        "seconds": 0.871,
+        "counts": [
+          34,
+          1,
+          70061
+        ],
+        "emitted_bytes": 3220
+      },
+      "default": {
+        "exit": 0,
+        "seconds": 0.882,
+        "counts": [
+          34,
+          1,
+          70061
+        ],
+        "emitted_bytes": 3220
+      },
+      "opt-in": {
+        "exit": 0,
+        "seconds": 0.933,
+        "counts": [
+          29,
+          0,
+          96349
+        ],
+        "emitted_bytes": 1177
+      },
+      "steps_per_block": 400000
+    },
+    {
+      "case": "sg-9ea30",
+      "sample": "SGuard64.exe",
+      "entry": "0x14009ea30",
+      "master": {
+        "exit": 0,
+        "seconds": 27.089,
+        "counts": [
+          362,
+          2,
+          1137225
+        ],
+        "emitted_bytes": 261674
+      },
+      "default": {
+        "exit": 0,
+        "seconds": 26.869,
+        "counts": [
+          361,
+          1,
+          1166667
+        ],
+        "emitted_bytes": 262936
+      },
+      "opt-in": {
+        "exit": 0,
+        "seconds": 13.104,
+        "counts": [
+          367,
+          0,
+          1259573
+        ],
+        "emitted_bytes": 221444
+      },
+      "steps_per_block": 400000
+    },
+    {
+      "case": "sg-af280-2m",
+      "sample": "SGuard64.exe",
+      "entry": "0x1400af280",
+      "master": {
+        "exit": 0,
+        "seconds": 6.158,
+        "counts": [
+          29,
+          0,
+          937755
+        ],
+        "emitted_bytes": 5547
+      },
+      "default": {
+        "exit": 0,
+        "seconds": 5.807,
+        "counts": [
+          29,
+          0,
+          937755
+        ],
+        "emitted_bytes": 5547
+      },
+      "opt-in": {
+        "exit": 0,
+        "seconds": 4.829,
+        "counts": [
+          23,
+          0,
+          920078
+        ],
+        "emitted_bytes": 5308
+      },
+      "steps_per_block": 2000000
+    }
+  ],
+  "scope": "Historical PR #4 output counts; zero unresolved does not imply a structurally valid CFG. See regression-fixes report."
+}
