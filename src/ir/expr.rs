@@ -1810,11 +1810,14 @@ impl Arena {
                 if self.is_complement(a, b) {
                     return Some(self.constant(mask, width));
                 }
-                // (A | c1) ^ c2 where c1 & c2 == c1 -> A ^ (c1 ^ c2)
-                // This helps flatten nested constants in XOR chains
+                // Forced OR bits must first be cleared from A before merging
+                // XOR constants: (A|c1)^c2 = (A & ~c1) ^ (c1^c2).
+                // Omitting the mask restores A's overlapping bits and is wrong.
                 if let (Some(c2), Some((BinOp::Or, x, y))) = (cb, self.as_bin(a)) {
                     if let Some(c1) = self.as_const(y) {
-                        if (c1 & c2) == c1 {
+                        if (c1 & c2) == c1 && self.width(x) == width {
+                            let clear = self.constant(mask ^ c1, width);
+                            let x = self.bin(BinOp::And, x, clear);
                             let k = self.constant(c1 ^ c2, width);
                             return Some(self.bin(BinOp::Xor, x, k));
                         }
@@ -2455,6 +2458,23 @@ mod composition_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xor_of_forced_bits_never_restores_overlapping_input_bits() {
+        for w in [Width::W8, Width::W16, Width::W32, Width::W64] {
+            let mut a = Arena::new();
+            let raw = a.init_reg(Reg::Rcx);
+            let x = a.trunc(raw, w);
+            let forced = a.constant(0x40, w);
+            let packed = a.bin(BinOp::Or, x, forced);
+            let toggled = a.constant(0x60, w);
+            let result = a.bin(BinOp::Xor, packed, toggled);
+            for v in [0u64, 0x40, 0x46, w.mask()] {
+                let env = HashMap::from([(Reg::Rcx, v)]);
+                assert_eq!(eval(&a, result, &env), ((v | 0x40) ^ 0x60) & w.mask());
+            }
+        }
+    }
 
     fn sym(a: &mut Arena, name: Reg) -> Ref {
         a.init_reg(name)
